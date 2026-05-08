@@ -1,35 +1,43 @@
 ---
 name: codeflow-guard
 description: 自动审查 Git 代码变更、PR、commit 或合并前改动，生成风险等级、测试建议和合并建议。适用于代码评审、发布前检查、研发质量保障等软件开发场景。
-allowed-tools: Read, Grep, Bash(git:*), Bash(npm:*), Bash(pnpm:*), Bash(pytest:*), Bash(python:*)
+allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*), Bash(pytest:*), Bash(python:*)
 ---
 
 # CodeFlow Guard
 
-使用本 Skill 审查代码变更时，按以下流程执行。
+使用本 Skill 审查代码变更时，先稳定收集审查上下文，再按风险规则输出报告。
 
-1. 查看当前仓库状态：`git status`
-2. 查看变更概览：`git diff --stat`
-3. 查看文件变更类型：`git diff --name-status`
-4. 查看具体改动：`git diff`
-5. 按风险规则分析安全、权限、接口兼容、数据变更、依赖、配置、性能和测试缺口
-6. 输出结构化审查报告，包含结论、风险、测试建议和合并建议
+## 审查流程
 
-## 使用资源
+1. 优先运行上下文采集脚本：
+   `node scripts/collect-review-context.js`
+2. 如果用户提供测试命令，传入脚本：
+   `node scripts/collect-review-context.js --test-cmd "<test command>"`
+3. 如果脚本不可用，再手动运行 `git status --short --branch`、`git diff --stat`、`git diff --name-status`、`git diff --check`、`git diff` 和相关测试命令。
+4. 读取 `references/risk-rubric.md` 判断风险等级。
+5. 读取 `references/output-template.md` 生成最终报告。
 
-- 需要判断风险等级时，读取 `references/risk-rubric.md`
-- 需要生成最终报告时，读取 `references/output-template.md`
+## Demo 项目提示
+
+审查本仓库自带 Demo 时，使用：
+
+```bash
+node scripts/collect-review-context.js --test-cmd "npm test --prefix examples/demo-project"
+```
 
 ## 风险等级
 
-- P0：阻断合并，可能导致严重安全、数据或生产事故
+- P0：阻断合并，可能导致严重安全、数据、资金、隐私或生产事故
 - P1：高风险，必须修复或补充验证
 - P2：中风险，建议修复或补充测试
 - P3：低风险，优化建议
 
 ## 输出要求
 
-- 只基于代码变更中的证据下结论
-- 引用具体文件、函数、配置项或变更点
-- 明确说明影响、建议动作和推荐测试
-- 最后给出“可合并 / 补测后合并 / 不建议合并”的判断
+- 使用中文输出。
+- 只基于代码变更、测试结果和采集上下文中的证据下结论。
+- 引用仓库根目录下的相对路径、函数名、配置项或变更点。
+- 顶部一句话摘要控制在 50 个汉字以内。
+- 单独列出 Top 3 必须修复项。
+- 最后给出“可合并 / 补测后合并 / 不建议合并”的判断和复审标准。
