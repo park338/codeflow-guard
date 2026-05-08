@@ -128,13 +128,13 @@ function buildReportContract(testCmd) {
   return `Final review output must include these top-level sections in order:
 
 1. 结论
-2. 审查上下文（必填）
-3. Top 3 必须修复项（必填）
+2. 审查上下文
+3. Top 3 必须修复项
 4. 变更摘要
-5. 关键风险（必填，使用卡片式条目）
-6. 测试建议（必填）
-7. 合并前检查清单（必填）
-8. 复审标准（必填）
+5. 关键风险
+6. 测试建议
+7. 合并前检查清单
+8. 复审标准
 
 Hard requirements:
 - Do not merge conclusion fields into one line.
@@ -142,6 +142,8 @@ Hard requirements:
 - Include the test command: ${testCmd || "(not provided)"}.
 - Include Diff Check result.
 - Top 3 and every key risk title must include path:line. Use Changed Line Anchors first, then Current File Snapshots.
+- Every item in Sensitive Literal Findings must appear in key risks and risk counts. Treat hardcoded key/token/secret/password/connection string as P0 unless clearly harmless test fixture.
+- Top 3 must prioritize auth bypass, hardcoded secrets/tokens, data or money risk, and skipped critical tests.
 - Do not call pass/skipped ratio coverage unless a coverage tool produced coverage data.
 - If skipped tests are present, list them as test risks.`;
 }
@@ -210,6 +212,99 @@ function buildChangedLineAnchors(diffText, maxAnchors) {
   }
 
   return anchors.join("\n");
+}
+
+function maskSensitiveValue(value) {
+  if (!value || value.length <= 8) {
+    return value;
+  }
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function classifySensitiveLine(content) {
+  const assignment = /(?:^|[\s,{])([A-Za-z_$][\w$]*(?:key|Key|KEY|token|Token|TOKEN|secret|Secret|SECRET|password|Password|PASSWORD|connectionString|ConnectionString|CONNECTION_STRING))\s*[:=]\s*["'][^"']+["']/.exec(content);
+  if (assignment) {
+    return { label: `hardcoded ${assignment[1]}` };
+  }
+
+  const checks = [
+    { label: "payment/live key", pattern: /\bsk_live_[A-Za-z0-9_=-]+/ },
+    { label: "api key", pattern: /\b(api[_-]?key|apikey)\b\s*[:=]\s*["'][^"']+["']/i },
+    { label: "token", pattern: /\b(token|access[_-]?token|refresh[_-]?token|override[_-]?token)\b\s*[:=]\s*["'][^"']+["']/i },
+    { label: "secret", pattern: /\b(secret|client[_-]?secret|jwt[_-]?secret)\b\s*[:=]\s*["'][^"']+["']/i },
+    { label: "password", pattern: /\b(password|passwd|pwd)\b\s*[:=]\s*["'][^"']+["']/i },
+    { label: "connection string", pattern: /\b(mongodb|postgres|mysql|redis):\/\/[^"'\s]+/i }
+  ];
+
+  return checks.find(check => check.pattern.test(content)) || null;
+}
+
+function extractSensitiveValue(content) {
+  const direct = content.match(/["']([^"']{6,})["']/);
+  if (direct) {
+    return maskSensitiveValue(direct[1]);
+  }
+  const uri = content.match(/\b(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+/i);
+  if (uri) {
+    return maskSensitiveValue(uri[0]);
+  }
+  return "(value not extracted)";
+}
+
+function buildSensitiveLiteralFindings(diffText) {
+  const findings = [];
+  const lines = diffText.split(/\r?\n/);
+  let filePath = null;
+  let oldLine = 0;
+  let newLine = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("+++ b/")) {
+      filePath = line.slice("+++ b/".length);
+      continue;
+    }
+    if (line.startsWith("+++ /dev/null")) {
+      filePath = null;
+      continue;
+    }
+
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      continue;
+    }
+
+    if (!filePath || oldLine <= 0 || newLine <= 0) {
+      continue;
+    }
+
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      const content = line.slice(1);
+      const classification = classifySensitiveLine(content);
+      if (classification) {
+        findings.push(`${filePath}:${newLine} | ${classification.label} | ${extractSensitiveValue(content)} | ${content.trim()}`);
+      }
+      newLine += 1;
+      continue;
+    }
+
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      oldLine += 1;
+      continue;
+    }
+
+    if (line.startsWith(" ")) {
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+
+  if (findings.length === 0) {
+    return "No added hardcoded key/token/secret/password/connection-string-like literals were detected.";
+  }
+
+  return findings.join("\n");
 }
 
 function looksTextLike(filePath) {
@@ -381,6 +476,7 @@ Diff base: ${base || "(no HEAD; working tree diff only)"}
   parts.push(section("Untracked Files", commandBlock("git ls-files --others --exclude-standard", untracked)));
   parts.push(section("Diff Stat", commandBlock(`${diffCommand} --stat`, diffStat)));
   parts.push(section("Diff Check", commandBlock(`${diffCommand} --check`, diffCheck)));
+  parts.push(section("Sensitive Literal Findings", buildSensitiveLiteralFindings(fullDiff.stdout || "")));
   parts.push(section("Changed Line Anchors", buildChangedLineAnchors(fullDiff.stdout || "", options.maxAnchors)));
 
   const diffOutput = truncate(fullDiff.stdout || fullDiff.stderr || "(no diff)", options.maxDiffChars);
