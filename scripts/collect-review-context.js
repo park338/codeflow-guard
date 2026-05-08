@@ -12,7 +12,8 @@ function parseArgs(argv) {
     noTests: false,
     maxDiffChars: 120000,
     maxFileChars: 20000,
-    maxFiles: 20
+    maxFiles: 20,
+    maxAnchors: 200
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -31,6 +32,8 @@ function parseArgs(argv) {
       options.maxFileChars = Number(argv[++i]);
     } else if (arg === "--max-files") {
       options.maxFiles = Number(argv[++i]);
+    } else if (arg === "--max-anchors") {
+      options.maxAnchors = Number(argv[++i]);
     } else if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
@@ -52,6 +55,7 @@ Options:
   --max-diff-chars <n>      Truncate full diff after n characters. Defaults to 120000.
   --max-file-chars <n>      Truncate each current file snapshot after n chars. Defaults to 20000.
   --max-files <n>           Max changed text files to snapshot. Defaults to 20.
+  --max-anchors <n>         Max changed line anchors to emit. Defaults to 200.
 `);
 }
 
@@ -118,6 +122,94 @@ function parseChangedFiles(nameStatusOutput) {
       return { status, filePath };
     })
     .filter(change => change.filePath && change.status !== "D");
+}
+
+function buildReportContract(testCmd) {
+  return `Final review output must include these top-level sections in order:
+
+1. 结论
+2. 审查上下文（必填）
+3. Top 3 必须修复项（必填）
+4. 变更摘要
+5. 关键风险（必填，使用卡片式条目）
+6. 测试建议（必填）
+7. 合并前检查清单（必填）
+8. 复审标准（必填）
+
+Hard requirements:
+- Do not merge conclusion fields into one line.
+- Include risk counts: P0/P1/P2/P3.
+- Include the test command: ${testCmd || "(not provided)"}.
+- Include Diff Check result.
+- Top 3 and every key risk title must include path:line. Use Changed Line Anchors first, then Current File Snapshots.
+- Do not call pass/skipped ratio coverage unless a coverage tool produced coverage data.
+- If skipped tests are present, list them as test risks.`;
+}
+
+function buildChangedLineAnchors(diffText, maxAnchors) {
+  const anchors = [];
+  const lines = diffText.split(/\r?\n/);
+  let filePath = null;
+  let oldLine = 0;
+  let newLine = 0;
+  let omitted = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("+++ b/")) {
+      filePath = line.slice("+++ b/".length);
+      continue;
+    }
+    if (line.startsWith("+++ /dev/null")) {
+      filePath = null;
+      continue;
+    }
+
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      continue;
+    }
+
+    if (!filePath || oldLine <= 0 || newLine <= 0) {
+      continue;
+    }
+
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      if (anchors.length < maxAnchors) {
+        anchors.push(`${filePath}:${newLine} | + ${line.slice(1)}`);
+      } else {
+        omitted += 1;
+      }
+      newLine += 1;
+      continue;
+    }
+
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      if (anchors.length < maxAnchors) {
+        anchors.push(`${filePath}:${oldLine} (deleted) | - ${line.slice(1)}`);
+      } else {
+        omitted += 1;
+      }
+      oldLine += 1;
+      continue;
+    }
+
+    if (line.startsWith(" ")) {
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+
+  if (anchors.length === 0) {
+    return "No changed line anchors were parsed from diff.";
+  }
+
+  if (omitted > 0) {
+    anchors.push(`(${omitted} changed line anchors omitted by --max-anchors)`);
+  }
+
+  return anchors.join("\n");
 }
 
 function looksTextLike(filePath) {
@@ -283,11 +375,13 @@ Branch: ${branch.stdout.trim() || "(detached or unknown)"}
 Diff base: ${base || "(no HEAD; working tree diff only)"}
 `);
 
+  parts.push(section("Report Contract", buildReportContract(testCmd)));
   parts.push(section("Repository State", commandBlock("git status --short --branch", status)));
   parts.push(section("Changed Files", commandBlock(`${diffCommand} --name-status`, nameStatus)));
   parts.push(section("Untracked Files", commandBlock("git ls-files --others --exclude-standard", untracked)));
   parts.push(section("Diff Stat", commandBlock(`${diffCommand} --stat`, diffStat)));
   parts.push(section("Diff Check", commandBlock(`${diffCommand} --check`, diffCheck)));
+  parts.push(section("Changed Line Anchors", buildChangedLineAnchors(fullDiff.stdout || "", options.maxAnchors)));
 
   const diffOutput = truncate(fullDiff.stdout || fullDiff.stderr || "(no diff)", options.maxDiffChars);
   parts.push(section("Full Diff", `Command: ${diffCommand}
