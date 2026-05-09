@@ -1284,10 +1284,13 @@ function buildReportContract(testCmd) {
 3. 最终 P0/P1/P2/P3、风险计数和合并建议由你根据证据与 risk-rubric.md 判断。
 
 硬约束：
-- 结论区一项一行，包含合并建议、总体风险、摘要、风险计数、测试状态和测试结果。
-- 审查上下文必须包含测试命令：${testCmd || "(not provided)"}，以及 Diff Check 结果。
+- 结论区一项一行，包含合并建议、总体风险、摘要、风险计数、测试执行状态、测试执行结果和静态发现跳过测试。
+- 测试未运行时，“测试执行结果”必须写“无执行结果”，不要写“通过=0，失败=0，跳过=0”。
+- 审查上下文必须包含待判断文件数、审查模式、Git diff 变更文件数、测试命令（${testCmd || "(not provided)"}）和 Diff Check 结果。
+- Git diff 变更文件数为 0 只代表当前无 diff 改动，不代表本次无审查内容。
 - Top 3 和关键风险标题使用 path:line；优先取 Changed Line Anchors，再取 Current File Snapshots。
 - Sensitive Literal Findings 是证据来源；是否进入关键风险及风险等级由你结合上下文判断，敏感值只引用脱敏证据。
+- 风险计数按“关键风险”条目数量统计；同一根因可以合并为一个条目，但计数必须与条目总数一致。
 - 没有 coverage 工具输出时，不要把通过/跳过比例写成覆盖率。
 - skipped 测试必须作为测试风险。`;
 }
@@ -1649,26 +1652,54 @@ function buildReviewSignalsBrief(signals, maxSignals = 15) {
 }
 
 /**
+ * Count static skipped-test signals discovered from source/test files.
+ * 中文：统计静态代码中发现的跳过测试信号数量（不包含测试执行输出里的 skipped）。
+ *
+ * @param {{type:string,location:string}[]} reviewSignals Review signals.
+ * @returns {number} Unique skipped-test signal count.
+ */
+function countStaticSkippedTestSignals(reviewSignals) {
+  const skippedSignalTypes = new Set(["skipped_test_signal", "current_skipped_test_signal"]);
+  const locations = new Set();
+
+  for (const signal of reviewSignals || []) {
+    if (!signal || !skippedSignalTypes.has(signal.type) || !signal.location) {
+      continue;
+    }
+    locations.add(signal.location);
+  }
+
+  return locations.size;
+}
+
+/**
  * Summarize parsed test evidence for the brief section.
  * 中文：为简版摘要生成测试证据，避免把 skipped 或未解析结果误读为覆盖率。
  *
  * @param {string|null} testCmd Test command.
  * @param {{status:number}|null} testResult Test command result.
  * @param {object|null} parsedTestSummary Parsed test summary.
+ * @param {number} staticSkippedTestsCount Static skipped-test signal count.
  * @returns {string} Compact test summary.
  */
-function buildTestBrief(testCmd, testResult, parsedTestSummary) {
+function buildTestBrief(testCmd, testResult, parsedTestSummary, staticSkippedTestsCount) {
   if (!testCmd || !testResult) {
-    return "- 测试命令：(未提供)\n- 测试结果：未运行";
+    return `- 测试命令：(未提供)
+- 测试执行状态：未运行
+- 测试执行结果：无执行结果
+- 静态发现跳过测试：${staticSkippedTestsCount}`;
   }
 
-  const parsed = parsedTestSummary
-    ? `总数=${parsedTestSummary.tests ?? "unknown"}，通过=${parsedTestSummary.pass ?? "unknown"}，失败=${parsedTestSummary.fail ?? "unknown"}，跳过=${parsedTestSummary.skipped ?? "unknown"}`
+  const executionStatus = testResult.status === 0 ? "已运行" : "运行失败";
+  const executionResult = parsedTestSummary
+    ? `通过=${parsedTestSummary.pass ?? "unknown"}，失败=${parsedTestSummary.fail ?? "unknown"}，跳过=${parsedTestSummary.skipped ?? "unknown"}`
     : "未解析到结构化统计，需读取 Test Result 原始输出";
 
   return `- 测试命令：${testCmd}
-- 退出码：${testResult.status}
-- 统计：${parsed}`;
+- 测试执行状态：${executionStatus}
+- 测试执行结果：${executionResult}
+- 静态发现跳过测试：${staticSkippedTestsCount}
+- 退出码：${testResult.status}`;
 }
 
 /**
@@ -1683,10 +1714,19 @@ function buildTestBrief(testCmd, testResult, parsedTestSummary) {
  * @param {string|null} input.testCmd Test command.
  * @param {{status:number}|null} input.testResult Test command result.
  * @param {object|null} input.parsedTestSummary Parsed test summary.
+ * @param {string[]} input.scopePaths User-provided scope paths.
  * @param {{status:number}} input.diffCheck Diff check result.
  * @returns {string} Compact Markdown brief.
  */
-function buildReviewBrief({ reviewFiles, changedFiles, reviewSignals, testCmd, testResult, parsedTestSummary, diffCheck }) {
+function buildReviewBrief({ reviewFiles, changedFiles, reviewSignals, testCmd, testResult, parsedTestSummary, scopePaths = [], diffCheck }) {
+  const reviewMode = scopePaths.length > 0
+    ? `指定路径 + 直接引用扩展（${scopePaths.join(", ")}）`
+    : "未指定路径，扫描仓库全部可审查文件";
+  const noDiffButHasReviewFilesNote = changedFiles.length === 0 && reviewFiles.length > 0
+    ? "\n- 说明：Git diff 变更文件数为 0 仅表示当前无 diff 改动，不代表本次无审查内容。"
+    : "";
+  const staticSkippedTestsCount = countStaticSkippedTestSignals(reviewSignals);
+
   return `先处理本节；后续章节只用于取证、行号和原始输出。
 
 职责边界：
@@ -1695,7 +1735,8 @@ function buildReviewBrief({ reviewFiles, changedFiles, reviewSignals, testCmd, t
 
 审查覆盖：
 - 待判断文件数：${reviewFiles.length}
-- 变更文件数：${changedFiles.length}
+- 审查模式：${reviewMode}
+- Git diff 变更文件数：${changedFiles.length}${noDiffButHasReviewFilesNote}
 - 下面每个文件都必须进入“变更摘要”，并给出一句文件级判断。
 - 目录名不能作为跳过理由；只要在待判断文件中，就按实际变更审查。
 
@@ -1706,7 +1747,7 @@ ${buildReviewFilesBrief(reviewFiles)}
 ${buildReviewSignalsBrief(reviewSignals)}
 
 验证状态：
-${buildTestBrief(testCmd, testResult, parsedTestSummary)}
+${buildTestBrief(testCmd, testResult, parsedTestSummary, staticSkippedTestsCount)}
 - Diff Check 退出码：${diffCheck.status}`;
 }
 
@@ -1774,7 +1815,7 @@ function detectReviewSignals(diffText, ignoredPaths, parsedTestSummary) {
       });
     }
 
-    if (/test\.skip|describe\.skip|it\.skip/.test(record.content)) {
+    if (isTestFile && /test\.skip|describe\.skip|it\.skip/.test(record.content)) {
       addSignal({
         type: "skipped_test_signal",
         dedupeKey: `skipped_critical_test:${record.filePath}:${record.lineNumber}`,
@@ -2398,6 +2439,7 @@ ${buildReviewScopeSummary(ignoredPathList, scopePaths, ownSkillIgnoredPath)}
     testCmd,
     testResult,
     parsedTestSummary,
+    scopePaths,
     diffCheck
   })));
 
