@@ -314,6 +314,24 @@ ${body}
 }
 
 /**
+ * Combine command results when one report section has multiple evidence sources.
+ * 中文：当一个报告区块来自多个证据来源时，合并命令结果并保留所有输出。
+ * This keeps section output complete without pretending synthetic evidence came
+ * from a single raw Git command.
+ *
+ * @param {...{status:number, stdout:string, stderr:string, error:string}[]} results Command results.
+ * @returns {{status:number, stdout:string, stderr:string, error:string}} Combined command result.
+ */
+function combineCommandResults(...results) {
+  return {
+    status: results.some(result => result.status !== 0) ? results.find(result => result.status !== 0).status : 0,
+    stdout: results.map(result => result.stdout).filter(Boolean).join("\n"),
+    stderr: results.map(result => result.stderr).filter(Boolean).join("\n"),
+    error: results.map(result => result.error).filter(Boolean).join("\n")
+  };
+}
+
+/**
  * Build the Changed Files section after removing noisy gitlink paths.
  * 中文：生成变更文件区块，并把 gitlink 或子仓库路径单独过滤展示。
  * Git submodules or nested repositories can appear as changed entries but are
@@ -455,6 +473,51 @@ function parseNameStatusLines(nameStatusOutput) {
 }
 
 /**
+ * Parse `git ls-files --others` output into added-file change records.
+ * 中文：把未跟踪文件列表转换为新增文件变更记录，确保新文件也进入完整审查链路。
+ * These records are merged with diff-derived changes so syntax checks,
+ * snapshots, priority findings, and sensitive literal checks do not miss newly
+ * created files that have not been staged yet.
+ *
+ * @param {string} untrackedOutput Raw untracked-file list from Git.
+ * @returns {{status:string, filePath:string}[]} Added-file records.
+ */
+function parseUntrackedLines(untrackedOutput) {
+  return untrackedOutput
+    .split(/\r?\n/)
+    .map(line => normalizeRepoPath(line.trim()))
+    .filter(Boolean)
+    .map(filePath => ({ status: "A", filePath }));
+}
+
+/**
+ * Merge changed-file records while preserving the first status seen per path.
+ * 中文：合并变更文件记录，并按路径去重，避免同一文件重复进入快照和语法检查。
+ * Diff records take precedence over untracked records because they contain the
+ * authoritative Git status for tracked paths.
+ *
+ * @param {...{status:string,filePath:string}[][]} changeGroups Change arrays.
+ * @returns {{status:string,filePath:string}[]} Deduplicated changes.
+ */
+function mergeChangeRecords(...changeGroups) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const group of changeGroups) {
+    for (const change of group || []) {
+      const filePath = normalizeRepoPath(change.filePath);
+      if (!filePath || seen.has(filePath)) {
+        continue;
+      }
+      seen.add(filePath);
+      merged.push({ status: change.status, filePath });
+    }
+  }
+
+  return merged;
+}
+
+/**
  * Determine whether a changed path is a gitlink or nested repository path.
  * 中文：判断变更路径是否为 gitlink 或嵌套仓库，避免当作普通文本文件处理。
  * In a parent repository, gitlinks behave like directory entries instead of
@@ -564,6 +627,20 @@ function splitChangedFiles(changes, repoRoot) {
 }
 
 /**
+ * Filter untracked files with the same support-path rules used for tracked diffs.
+ * 中文：使用和跟踪文件 diff 相同的辅助路径规则过滤未跟踪文件。
+ * This keeps the "all repository changes except Skill support paths" promise
+ * consistent across tracked, unstaged, staged, and untracked changes.
+ *
+ * @param {string} untrackedOutput Raw untracked-file list from Git.
+ * @param {string} repoRoot Repository root for path filtering.
+ * @returns {{changes:{status:string,filePath:string}[], ignoredChanges:{status:string,filePath:string}[]}}
+ */
+function splitUntrackedFiles(untrackedOutput, repoRoot) {
+  return splitChangedFiles(parseUntrackedLines(untrackedOutput), repoRoot);
+}
+
+/**
  * Render excluded paths for the document header.
  * 中文：把审查排除范围渲染到报告头部，避免使用者误解当前脚本忽略了哪些路径。
  *
@@ -573,6 +650,182 @@ function splitChangedFiles(changes, repoRoot) {
 function buildReviewScopeSummary(ignoredPaths) {
   const ignores = normalizePathList(ignoredPaths);
   return `Review scope: all repository changes${ignores.length > 0 ? ` except ${ignores.join(", ")}` : ""}`;
+}
+
+/**
+ * Escape a line for safe inclusion in a synthetic unified diff.
+ * 中文：对合成 unified diff 中的单行内容做基础清理，避免二进制或控制字符破坏输出结构。
+ *
+ * @param {string} line Source line.
+ * @returns {string} Diff-safe line.
+ */
+function sanitizeDiffLine(line) {
+  return line.replace(/\0/g, "\\0");
+}
+
+/**
+ * Read an untracked text file and render it as a standard added-file diff.
+ * 中文：读取未跟踪文本文件，并渲染为标准新增文件 diff。
+ * The generated shape mirrors Git's unified diff enough for the script's own
+ * parsers and for downstream LLM review, without requiring staging.
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string} filePath Repository-relative file path.
+ * @returns {string|null} Synthetic diff text, or null when skipped.
+ */
+function buildAddedFileDiff(repoRoot, filePath) {
+  const normalizedPath = normalizeRepoPath(filePath);
+  const lines = readRepoTextLines(repoRoot, normalizedPath);
+  if (!lines) {
+    return null;
+  }
+
+  const body = lines.map(line => `+${sanitizeDiffLine(line)}`);
+  return [
+    `diff --git a/${normalizedPath} b/${normalizedPath}`,
+    "new file mode 100644",
+    "index 0000000..0000000",
+    "--- /dev/null",
+    `+++ b/${normalizedPath}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...body
+  ].join("\n");
+}
+
+/**
+ * Read normalized lines from a repository text file.
+ * 中文：读取仓库内文本文件并统一换行，供未跟踪文件的合成证据复用。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string} filePath Repository-relative file path.
+ * @returns {string[]|null} Text lines, or null when the file should be skipped.
+ */
+function readRepoTextLines(repoRoot, filePath) {
+  const absolutePath = path.resolve(repoRoot, filePath);
+  const relativeRoot = path.relative(repoRoot, absolutePath);
+  if (relativeRoot.startsWith("..") || path.isAbsolute(relativeRoot)) {
+    return null;
+  }
+  if (!fs.existsSync(absolutePath) || !looksTextLike(filePath)) {
+    return null;
+  }
+
+  const buffer = fs.readFileSync(absolutePath);
+  if (buffer.includes(0)) {
+    return null;
+  }
+
+  const text = buffer.toString("utf8").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = text.length > 0 ? text.split("\n") : [];
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines;
+}
+
+/**
+ * Build a small stat summary for untracked text files.
+ * 中文：为未跟踪文本文件生成简洁 stat 摘要，补齐 `git diff --stat` 覆盖不到的新文件。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {{status:string,filePath:string}[]} untrackedChanges Reviewable untracked files.
+ * @returns {{status:number, stdout:string, stderr:string, error:string}} Synthetic stat result.
+ */
+function buildUntrackedStat(repoRoot, untrackedChanges) {
+  const lines = [];
+  for (const change of untrackedChanges) {
+    const textLines = readRepoTextLines(repoRoot, change.filePath);
+    if (!textLines) {
+      continue;
+    }
+    const additions = textLines.length;
+    const pluses = "+".repeat(Math.min(additions, 80));
+    lines.push(`${change.filePath} | ${additions} ${pluses}`);
+  }
+
+  return {
+    status: 0,
+    stdout: lines.join("\n"),
+    stderr: "",
+    error: ""
+  };
+}
+
+/**
+ * Run a lightweight whitespace check for untracked text files.
+ * 中文：对未跟踪文本文件执行轻量空白检查，弥补 `git diff --check` 不检查新文件的问题。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {{status:string,filePath:string}[]} untrackedChanges Reviewable untracked files.
+ * @returns {{status:number, stdout:string, stderr:string, error:string}} Synthetic check result.
+ */
+function buildUntrackedDiffCheck(repoRoot, untrackedChanges) {
+  const findings = [];
+  for (const change of untrackedChanges) {
+    const textLines = readRepoTextLines(repoRoot, change.filePath);
+    if (!textLines) {
+      continue;
+    }
+    textLines.forEach((line, index) => {
+      if (/[ \t]+$/.test(line)) {
+        findings.push(`${change.filePath}:${index + 1}: trailing whitespace.`);
+        findings.push(`+${line}`);
+      }
+    });
+  }
+
+  return {
+    status: findings.length > 0 ? 2 : 0,
+    stdout: findings.join("\n"),
+    stderr: "",
+    error: ""
+  };
+}
+
+/**
+ * Build a synthetic diff for untracked text files.
+ * 中文：为未跟踪文本文件生成合成 diff，让新文件也能进入风险预扫描和行锚点。
+ * Git's normal working-tree diff omits untracked files. Synthetic added-file
+ * hunks give downstream parsers the same evidence shape without requiring
+ * users to stage their work.
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {{status:string,filePath:string}[]} untrackedChanges Reviewable untracked files.
+ * @returns {{status:number, stdout:string, stderr:string, error:string}} Synthetic diff result.
+ */
+function buildUntrackedDiff(repoRoot, untrackedChanges) {
+  const diffParts = [];
+
+  for (const change of untrackedChanges) {
+    const syntheticDiff = buildAddedFileDiff(repoRoot, change.filePath);
+    if (syntheticDiff) {
+      diffParts.push(syntheticDiff);
+    }
+  }
+
+  return {
+    status: 0,
+    stdout: diffParts.join("\n"),
+    stderr: "",
+    error: ""
+  };
+}
+
+/**
+ * Combine tracked and untracked diff results into one review diff.
+ * 中文：合并跟踪文件 diff 和未跟踪文件合成 diff，形成完整审查输入。
+ *
+ * @param {{status:number, stdout:string, stderr:string, error:string}} trackedDiff Tracked Git diff.
+ * @param {{status:number, stdout:string, stderr:string, error:string}} untrackedDiff Synthetic untracked diff.
+ * @returns {{status:number, stdout:string, stderr:string, error:string}} Combined diff result.
+ */
+function combineDiffResults(trackedDiff, untrackedDiff) {
+  return {
+    status: trackedDiff.status !== 0 ? trackedDiff.status : untrackedDiff.status,
+    stdout: [trackedDiff.stdout, untrackedDiff.stdout].filter(Boolean).join("\n"),
+    stderr: [trackedDiff.stderr, untrackedDiff.stderr].filter(Boolean).join("\n"),
+    error: [trackedDiff.error, untrackedDiff.error].filter(Boolean).join("\n")
+  };
 }
 
 /**
@@ -652,7 +905,7 @@ function buildChangedLineAnchors(diffText, maxAnchors, ignoredPaths = new Set())
       continue;
     }
 
-    if (!filePath || ignoredPaths.has(filePath) || oldLine <= 0 || newLine <= 0) {
+    if (!filePath || ignoredPaths.has(filePath) || newLine <= 0) {
       continue;
     }
 
@@ -666,7 +919,7 @@ function buildChangedLineAnchors(diffText, maxAnchors, ignoredPaths = new Set())
       continue;
     }
 
-    if (line.startsWith("-") && !line.startsWith("---")) {
+    if (line.startsWith("-") && !line.startsWith("---") && oldLine > 0) {
       if (anchors.length < maxAnchors) {
         anchors.push(`${filePath}:${oldLine} (deleted) | - ${line.slice(1)}`);
       } else {
@@ -822,7 +1075,7 @@ function parseDiffLineRecords(diffText, ignoredPaths = new Set()) {
       continue;
     }
 
-    if (!filePath || ignoredPaths.has(filePath) || oldLine <= 0 || newLine <= 0) {
+    if (!filePath || ignoredPaths.has(filePath) || newLine <= 0) {
       continue;
     }
 
@@ -838,7 +1091,7 @@ function parseDiffLineRecords(diffText, ignoredPaths = new Set()) {
       continue;
     }
 
-    if (line.startsWith("-") && !line.startsWith("---")) {
+    if (line.startsWith("-") && !line.startsWith("---") && oldLine > 0) {
       records.push({
         filePath,
         lineNumber: oldLine,
@@ -1077,7 +1330,7 @@ function buildSensitiveLiteralFindings(diffText, ignoredPaths = new Set()) {
       continue;
     }
 
-    if (!filePath || ignoredPaths.has(filePath) || oldLine <= 0 || newLine <= 0) {
+    if (!filePath || ignoredPaths.has(filePath) || newLine <= 0) {
       continue;
     }
 
@@ -1358,7 +1611,7 @@ function detectDefaultTestCommand(repoRoot) {
   }
 
   try {
-    const pkg = JSON.parse(fs.readFileSync(packageJson, "utf8"));
+    const pkg = JSON.parse(fs.readFileSync(packageJson, "utf8").replace(/^\uFEFF/, ""));
     return pkg.scripts && pkg.scripts.test ? "npm test" : null;
   } catch {
     return null;
@@ -1403,12 +1656,42 @@ function main() {
   const untracked = runGit(buildScopedGitArgs(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList), repoRoot);
   const nameStatus = runGit(buildDiffArgs(base, ["--name-status"], staticIgnoredPathList), repoRoot);
   const parsedChangedFiles = parseNameStatusLines(nameStatus.stdout);
-  const { changes: changedFiles, ignoredChanges } = splitChangedFiles(parsedChangedFiles, repoRoot);
-  const ignoredPathList = normalizePathList([...staticIgnoredPathList, ...ignoredChanges.map(change => change.filePath)]);
+  const { changes: trackedChanges, ignoredChanges } = splitChangedFiles(parsedChangedFiles, repoRoot);
+  const { changes: untrackedChanges, ignoredChanges: ignoredUntrackedChanges } = splitUntrackedFiles(untracked.stdout, repoRoot);
+  const changedFiles = mergeChangeRecords(trackedChanges, untrackedChanges);
+  const changedFilesResult = combineCommandResults(nameStatus, {
+    status: 0,
+    stdout: untrackedChanges.map(change => `${change.status}\t${change.filePath}`).join("\n"),
+    stderr: "",
+    error: ""
+  });
+  const changedFilesCommand = untrackedChanges.length > 0
+    ? `${buildDiffCommand(base, ["--name-status"], staticIgnoredPathList)} + ${buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList)}`
+    : buildDiffCommand(base, ["--name-status"], staticIgnoredPathList);
+  const ignoredPathList = normalizePathList([
+    ...staticIgnoredPathList,
+    ...ignoredChanges.map(change => change.filePath),
+    ...ignoredUntrackedChanges.map(change => change.filePath)
+  ]);
   const ignoredPaths = new Set(ignoredPathList);
-  const diffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList), repoRoot);
-  const diffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList), repoRoot);
-  const fullDiff = runGit(buildDiffArgs(base, [], ignoredPathList), repoRoot);
+  const trackedDiffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList), repoRoot);
+  const untrackedDiffStat = buildUntrackedStat(repoRoot, untrackedChanges);
+  const diffStat = combineCommandResults(trackedDiffStat, untrackedDiffStat);
+  const diffStatCommand = untrackedChanges.length > 0
+    ? `${buildDiffCommand(base, ["--stat"], ignoredPathList)} + untracked-file stat`
+    : buildDiffCommand(base, ["--stat"], ignoredPathList);
+  const trackedDiffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList), repoRoot);
+  const untrackedDiffCheck = buildUntrackedDiffCheck(repoRoot, untrackedChanges);
+  const diffCheck = combineCommandResults(trackedDiffCheck, untrackedDiffCheck);
+  const diffCheckCommand = untrackedChanges.length > 0
+    ? `${buildDiffCommand(base, ["--check"], ignoredPathList)} + untracked-file whitespace check`
+    : buildDiffCommand(base, ["--check"], ignoredPathList);
+  const trackedDiff = runGit(buildDiffArgs(base, [], ignoredPathList), repoRoot);
+  const untrackedDiff = buildUntrackedDiff(repoRoot, untrackedChanges);
+  const fullDiff = combineDiffResults(trackedDiff, untrackedDiff);
+  const fullDiffCommand = untrackedChanges.length > 0
+    ? `${buildDiffCommand(base, [], ignoredPathList)} + synthetic untracked-file diff`
+    : buildDiffCommand(base, [], ignoredPathList);
 
   const testCmd = options.noTests ? null : options.testCmd || detectDefaultTestCommand(repoRoot);
   const testResult = testCmd ? run(testCmd, [], repoRoot, true) : null;
@@ -1429,16 +1712,16 @@ ${buildReviewScopeSummary(ignoredPathList)}
   parts.push(section("Review Decision Floor", buildReviewDecisionFloor(priorityFindings)));
   parts.push(section("Priority Findings", buildPriorityFindings(priorityFindings)));
   parts.push(section("Repository State", commandBlock(buildScopedGitCommand(["status", "--short", "--branch"], staticIgnoredPathList), status)));
-  parts.push(section("Changed Files", buildChangedFilesSection(buildDiffCommand(base, ["--name-status"], staticIgnoredPathList), nameStatus, changedFiles, ignoredChanges)));
+  parts.push(section("Changed Files", buildChangedFilesSection(changedFilesCommand, changedFilesResult, changedFiles, [...ignoredChanges, ...ignoredUntrackedChanges])));
   parts.push(section("Untracked Files", commandBlock(buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList), untracked)));
-  parts.push(section("Diff Stat", commandBlock(buildDiffCommand(base, ["--stat"], ignoredPathList), diffStat)));
-  parts.push(section("Diff Check", commandBlock(buildDiffCommand(base, ["--check"], ignoredPathList), diffCheck)));
+  parts.push(section("Diff Stat", commandBlock(diffStatCommand, diffStat)));
+  parts.push(section("Diff Check", commandBlock(diffCheckCommand, diffCheck)));
   parts.push(section("Syntax Check", buildSyntaxCheck(repoRoot, changedFiles)));
   parts.push(section("Sensitive Literal Findings", buildSensitiveLiteralFindings(fullDiff.stdout || "", ignoredPaths)));
   parts.push(section("Changed Line Anchors", buildChangedLineAnchors(fullDiff.stdout || "", options.maxAnchors, ignoredPaths)));
 
   const diffOutput = truncate(redactText(fullDiff.stdout || fullDiff.stderr || "(no diff)"), options.maxDiffChars);
-  parts.push(section("Full Diff", `Command: ${buildDiffCommand(base, [], ignoredPathList)}
+  parts.push(section("Full Diff", `Command: ${fullDiffCommand}
 Exit code: ${fullDiff.status}
 
 \`\`\`diff
