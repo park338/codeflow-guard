@@ -169,31 +169,83 @@ ${body}
  * not useful for file snapshots or line-level review; they are shown separately
  * so the report stays transparent without polluting the main changed-file list.
  *
- * @param {string} diffCommand Base diff command displayed in the report.
+ * @param {string} diffCommand Full diff command displayed in the report.
  * @param {{status:number, stdout:string, stderr:string, error:string}} nameStatusResult Raw git name-status result.
  * @param {{status:string, filePath:string}[]} changes Reviewable file changes.
- * @param {{status:string, filePath:string}[]} ignoredGitlinks Filtered gitlink/submodule entries.
+ * @param {{status:string, filePath:string}[]} ignoredChanges Filtered support entries.
  * @returns {string} Markdown command block for changed files.
  */
-function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignoredGitlinks) {
+function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignoredChanges) {
   const lines = changes.length > 0
     ? changes.map(change => `${change.status}\t${change.filePath}`)
     : ["(no output)"];
 
-  if (ignoredGitlinks.length > 0) {
+  if (ignoredChanges.length > 0) {
     lines.push("");
-    lines.push("Filtered gitlink/submodule paths:");
-    for (const change of ignoredGitlinks) {
+    lines.push("Filtered support paths:");
+    for (const change of ignoredChanges) {
       lines.push(`${change.status}\t${change.filePath}`);
     }
   }
 
-  return commandBlock(`${diffCommand} --name-status`, {
+  return commandBlock(diffCommand, {
     status: nameStatusResult.status,
     stdout: lines.join("\n"),
     stderr: nameStatusResult.stderr,
     error: nameStatusResult.error
   });
+}
+
+/**
+ * Build git diff arguments with optional path exclusions.
+ * 中文：构造 git diff 参数，并在需要时排除 Skill 自身等辅助路径。
+ * Pathspec exclusions are applied after `--` so normal product-code paths still
+ * flow into every diff-derived evidence section.
+ *
+ * @param {string|null} base Diff base ref, or null for working-tree diff only.
+ * @param {string[]} options Git diff options such as `--stat` or `--check`.
+ * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @returns {string[]} Arguments passed to `git`.
+ */
+function buildDiffArgs(base, options = [], ignoredPaths = []) {
+  const args = ["diff"];
+  if (base) {
+    args.push(base);
+  }
+  args.push(...options);
+  if (ignoredPaths.length > 0) {
+    args.push("--", ".");
+    for (const ignoredPath of ignoredPaths) {
+      args.push(`:(exclude)${ignoredPath}`);
+    }
+  }
+  return args;
+}
+
+/**
+ * Render the human-readable command matching `buildDiffArgs`.
+ * 中文：生成和实际 git diff 参数一致的可读命令，便于报告追溯证据来源。
+ * The command string is for evidence display only; command execution uses the
+ * structured argument array to avoid shell quoting issues.
+ *
+ * @param {string|null} base Diff base ref, or null for working-tree diff only.
+ * @param {string[]} options Git diff options.
+ * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @returns {string} Display command.
+ */
+function buildDiffCommand(base, options = [], ignoredPaths = []) {
+  const parts = ["git", "diff"];
+  if (base) {
+    parts.push(base);
+  }
+  parts.push(...options);
+  if (ignoredPaths.length > 0) {
+    parts.push("--", ".");
+    for (const ignoredPath of ignoredPaths) {
+      parts.push(`":(exclude)${ignoredPath}"`);
+    }
+  }
+  return parts.join(" ");
 }
 
 /**
@@ -292,33 +344,60 @@ function isGitlinkPath(repoRoot, filePath) {
 }
 
 /**
+ * Determine whether a changed path belongs to this skill package while another
+ * repository is being reviewed.
+ * 中文：判断变更路径是否属于当前 Skill 自身；审查外层业务仓库时应过滤这些路径。
+ * This prevents skill implementation edits from polluting product-code review,
+ * but it still allows this repository to review and maintain the skill itself.
+ *
+ * @param {string} repoRoot Repository root being inspected.
+ * @param {string} filePath Repository-relative changed path.
+ * @returns {boolean} True when the path points inside this skill package.
+ */
+function isOwnSkillPath(repoRoot, filePath) {
+  if (!repoRoot || !filePath) {
+    return false;
+  }
+
+  const skillRoot = path.resolve(__dirname, "..");
+  const reviewedRoot = path.resolve(repoRoot);
+  if (reviewedRoot === skillRoot) {
+    return false;
+  }
+
+  const absolute = path.resolve(reviewedRoot, filePath);
+  const relativeToSkill = path.relative(skillRoot, absolute);
+  return relativeToSkill === "" || (!relativeToSkill.startsWith("..") && !path.isAbsolute(relativeToSkill));
+}
+
+/**
  * Split parsed changes into reviewable files and ignored gitlink entries.
  * 中文：把变更拆分为可审查文件和需要忽略的 gitlink 条目。
- * Deleted files are also excluded from current snapshots because there is no
- * working-tree file to read; deletion evidence remains available in the diff.
+ * Deleted files remain reviewable for diff evidence, but later snapshot and
+ * syntax-check steps skip them because no current working-tree file exists.
  *
  * @param {{status:string, filePath:string}[]} changes Parsed name-status records.
  * @param {string} repoRoot Repository root for gitlink detection.
- * @returns {{changes:{status:string,filePath:string}[], ignoredGitlinks:{status:string,filePath:string}[]}}
+ * @returns {{changes:{status:string,filePath:string}[], ignoredChanges:{status:string,filePath:string}[]}}
  */
 function splitChangedFiles(changes, repoRoot) {
   const kept = [];
-  const ignoredGitlinks = [];
+  const ignoredChanges = [];
 
   for (const change of changes) {
-    if (!change.filePath || change.status.startsWith("D")) {
+    if (!change.filePath) {
       continue;
     }
 
-    if (isGitlinkPath(repoRoot, change.filePath)) {
-      ignoredGitlinks.push(change);
+    if (isOwnSkillPath(repoRoot, change.filePath) || isGitlinkPath(repoRoot, change.filePath)) {
+      ignoredChanges.push(change);
       continue;
     }
 
     kept.push(change);
   }
 
-  return { changes: kept, ignoredGitlinks };
+  return { changes: kept, ignoredChanges };
 }
 
 /**
@@ -370,17 +449,22 @@ function buildChangedLineAnchors(diffText, maxAnchors, ignoredPaths = new Set())
   const anchors = [];
   const lines = diffText.split(/\r?\n/);
   let filePath = null;
+  let oldFilePath = null;
   let oldLine = 0;
   let newLine = 0;
   let omitted = 0;
 
   for (const line of lines) {
+    if (line.startsWith("--- a/")) {
+      oldFilePath = line.slice("--- a/".length);
+      continue;
+    }
     if (line.startsWith("+++ b/")) {
       filePath = line.slice("+++ b/".length);
       continue;
     }
     if (line.startsWith("+++ /dev/null")) {
-      filePath = null;
+      filePath = oldFilePath;
       continue;
     }
 
@@ -614,7 +698,7 @@ function isJavaScriptFile(filePath) {
 function buildSyntaxCheck(repoRoot, changes) {
   const jsFiles = changes
     .map(change => change.filePath)
-    .filter(filePath => filePath && isJavaScriptFile(filePath));
+    .filter((filePath, index) => filePath && !changes[index].status.startsWith("D") && isJavaScriptFile(filePath));
 
   if (jsFiles.length === 0) {
     return "No changed JavaScript files to syntax-check.";
@@ -694,7 +778,8 @@ function readNumberedFile(repoRoot, filePath, maxChars) {
  * @returns {string} Markdown snapshots.
  */
 function buildFileSnapshots(repoRoot, changes, options) {
-  const scopedChanges = changes.slice(0, options.maxFiles);
+  const currentFileChanges = changes.filter(change => !change.status.startsWith("D"));
+  const scopedChanges = currentFileChanges.slice(0, options.maxFiles);
   if (scopedChanges.length === 0) {
     return "No changed text files to snapshot.";
   }
@@ -708,7 +793,7 @@ ${numbered}
 \`\`\``;
   });
 
-  const omitted = changes.length - scopedChanges.length;
+  const omitted = currentFileChanges.length - scopedChanges.length;
   if (omitted > 0) {
     snapshots.push(`(${omitted} changed files omitted by --max-files)`);
   }
@@ -860,20 +945,19 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
   const repoRoot = resolveRepoRoot(options.repo);
   const base = hasHead(repoRoot) ? options.base : null;
-  const diffArgs = base ? ["diff", base] : ["diff"];
-  const diffCommand = base ? `git diff ${base}` : "git diff";
   const generatedAt = new Date().toISOString();
 
   const branch = runGit(["branch", "--show-current"], repoRoot);
   const status = runGit(["status", "--short", "--branch"], repoRoot);
   const untracked = runGit(["ls-files", "--others", "--exclude-standard"], repoRoot);
-  const nameStatus = runGit([...diffArgs, "--name-status"], repoRoot);
-  const diffStat = runGit([...diffArgs, "--stat"], repoRoot);
-  const diffCheck = runGit([...diffArgs, "--check"], repoRoot);
-  const fullDiff = runGit(diffArgs, repoRoot);
+  const nameStatus = runGit(buildDiffArgs(base, ["--name-status"]), repoRoot);
   const parsedChangedFiles = parseNameStatusLines(nameStatus.stdout);
-  const { changes: changedFiles, ignoredGitlinks } = splitChangedFiles(parsedChangedFiles, repoRoot);
-  const ignoredPaths = new Set(ignoredGitlinks.map(change => change.filePath));
+  const { changes: changedFiles, ignoredChanges } = splitChangedFiles(parsedChangedFiles, repoRoot);
+  const ignoredPathList = ignoredChanges.map(change => change.filePath);
+  const ignoredPaths = new Set(ignoredPathList);
+  const diffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList), repoRoot);
+  const diffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList), repoRoot);
+  const fullDiff = runGit(buildDiffArgs(base, [], ignoredPathList), repoRoot);
 
   const testCmd = options.noTests ? null : options.testCmd || detectDefaultTestCommand(repoRoot);
   const testResult = testCmd ? run(testCmd, [], repoRoot, true) : null;
@@ -889,16 +973,16 @@ Diff base: ${base || "(no HEAD; working tree diff only)"}
 
   parts.push(section("Report Contract", buildReportContract(testCmd)));
   parts.push(section("Repository State", commandBlock("git status --short --branch", status)));
-  parts.push(section("Changed Files", buildChangedFilesSection(diffCommand, nameStatus, changedFiles, ignoredGitlinks)));
+  parts.push(section("Changed Files", buildChangedFilesSection(buildDiffCommand(base, ["--name-status"]), nameStatus, changedFiles, ignoredChanges)));
   parts.push(section("Untracked Files", commandBlock("git ls-files --others --exclude-standard", untracked)));
-  parts.push(section("Diff Stat", commandBlock(`${diffCommand} --stat`, diffStat)));
-  parts.push(section("Diff Check", commandBlock(`${diffCommand} --check`, diffCheck)));
+  parts.push(section("Diff Stat", commandBlock(buildDiffCommand(base, ["--stat"], ignoredPathList), diffStat)));
+  parts.push(section("Diff Check", commandBlock(buildDiffCommand(base, ["--check"], ignoredPathList), diffCheck)));
   parts.push(section("Syntax Check", buildSyntaxCheck(repoRoot, changedFiles)));
   parts.push(section("Sensitive Literal Findings", buildSensitiveLiteralFindings(fullDiff.stdout || "", ignoredPaths)));
   parts.push(section("Changed Line Anchors", buildChangedLineAnchors(fullDiff.stdout || "", options.maxAnchors, ignoredPaths)));
 
   const diffOutput = truncate(redactText(fullDiff.stdout || fullDiff.stderr || "(no diff)"), options.maxDiffChars);
-  parts.push(section("Full Diff", `Command: ${diffCommand}
+  parts.push(section("Full Diff", `Command: ${buildDiffCommand(base, [], ignoredPathList)}
 Exit code: ${fullDiff.status}
 
 \`\`\`diff
