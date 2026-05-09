@@ -60,7 +60,8 @@ function parseArgs(argv) {
     maxDiffChars: 120000,
     maxFileChars: 20000,
     maxFiles: 20,
-    maxAnchors: 200
+    maxAnchors: 200,
+    briefOnly: false
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -76,6 +77,8 @@ function parseArgs(argv) {
       i += 1;
     } else if (arg === "--no-tests") {
       options.noTests = true;
+    } else if (arg === "--brief-only") {
+      options.briefOnly = true;
     } else if (arg === "--max-diff-chars") {
       options.maxDiffChars = readPositiveNumberOption(argv, i, arg);
       i += 1;
@@ -120,6 +123,7 @@ Options:
   --max-file-chars <n>      Truncate each current file snapshot after n chars. Defaults to 20000.
   --max-files <n>           Max changed text files to snapshot. Defaults to 20.
   --max-anchors <n>         Max changed line anchors to emit. Defaults to 200.
+  --brief-only              Print only the compact review brief.
 `);
 }
 
@@ -838,7 +842,7 @@ function combineDiffResults(trackedDiff, untrackedDiff) {
  * @returns {string} Human-readable report contract.
  */
 function buildReportContract(testCmd) {
-  return `最终审查报告必须按以下顶层章节顺序输出：
+  return `最终报告按 ` + "`references/output-template.md`" + ` 的 8 个章节输出：
 
 1. 结论
 2. 审查上下文
@@ -849,18 +853,18 @@ function buildReportContract(testCmd) {
 7. 合并前检查清单
 8. 复审标准
 
+优先级：
+1. 先按 Review Brief 做覆盖判断；“待判断文件”里的每个文件都必须进入“变更摘要”并给出判断。
+2. “必须覆盖风险”必须进入 Top 3 或关键风险，并计入风险计数。
+3. 最终结论不得低于 Review Brief 的结论下限；可以更严格。
+
 硬约束：
-- 必须先阅读并遵守 Review Decision Floor；最终结论不得低于其中的最低风险等级、最低合并建议和风险计数下限。
-- Priority Findings 中每一项都必须进入关键风险或 Top 3 候选；P0/P1 项必须计入风险计数。
-- 结论区必须一项一行，不能把合并建议、总体风险、摘要挤在同一行。
-- 必须包含风险计数：P0/P1/P2/P3。
-- 必须包含测试命令：${testCmd || "(not provided)"}。
-- 必须包含 Diff Check 结果。
-- Top 3 和每个关键风险标题必须包含 path:line。优先使用 Changed Line Anchors，再使用 Current File Snapshots。
-- Sensitive Literal Findings 中每一项都必须进入关键风险和风险计数；hardcoded key/token/secret/password/connection string 默认 P0，除非上下文证明只是无害测试 fixture。
-- Top 3 必须优先考虑认证绕过、硬编码密钥/令牌、数据/资金风险、关键测试被跳过。
+- 结论区一项一行，包含合并建议、总体风险、摘要、风险计数、测试状态和测试结果。
+- 审查上下文必须包含测试命令：${testCmd || "(not provided)"}，以及 Diff Check 结果。
+- Top 3 和关键风险标题使用 path:line；优先取 Changed Line Anchors，再取 Current File Snapshots。
+- Sensitive Literal Findings 全部进入关键风险和风险计数；敏感值只引用脱敏证据。
 - 没有 coverage 工具输出时，不要把通过/跳过比例写成覆盖率。
-- 发现 skipped 测试时，必须列为测试风险。`;
+- skipped 测试必须作为测试风险。`;
 }
 
 /**
@@ -1131,6 +1135,159 @@ function formatPriorityFinding(finding, index) {
 }
 
 /**
+ * Count priority findings by severity.
+ * 中文：按严重等级统计优先级风险，供简版摘要和决策下限复用。
+ *
+ * @param {{severity:string}[]} findings Priority findings.
+ * @returns {{P0:number,P1:number,P2:number,P3:number}} Severity counts.
+ */
+function countFindingsBySeverity(findings) {
+  const counts = { P0: 0, P1: 0, P2: 0, P3: 0 };
+  for (const finding of findings) {
+    if (Object.prototype.hasOwnProperty.call(counts, finding.severity)) {
+      counts[finding.severity] += 1;
+    }
+  }
+  return counts;
+}
+
+/**
+ * Derive the minimum overall risk and merge advice from finding counts.
+ * 中文：根据风险计数推导最低总体风险和最低合并建议。
+ *
+ * @param {{P0:number,P1:number,P2:number,P3:number}} counts Severity counts.
+ * @returns {{minimumRisk:string,minimumAdvice:string}} Decision floor.
+ */
+function buildDecisionFloor(counts) {
+  const minimumRisk = counts.P0 > 0 ? "P0" : counts.P1 > 0 ? "P1" : counts.P2 > 0 ? "P2" : counts.P3 > 0 ? "P3" : "P3";
+  const minimumAdvice = counts.P0 > 0 ? "不建议合并" : counts.P1 > 0 ? "补测后合并" : "可合并";
+  return { minimumRisk, minimumAdvice };
+}
+
+/**
+ * Render a short one-line priority finding for the brief section.
+ * 中文：把优先级风险渲染成一行摘要，降低 LLM 首屏输入复杂度。
+ *
+ * @param {{severity:string,type:string,location:string,evidence:string}} finding Priority finding.
+ * @param {number} index One-based finding index.
+ * @returns {string} Compact finding line.
+ */
+function formatPriorityFindingBrief(finding, index) {
+  return `${index}. ${finding.severity} ${finding.type} | ${finding.location} | ${finding.evidence}`;
+}
+
+/**
+ * Render a bounded changed-file list for the brief section.
+ * 中文：生成有上限的变更文件清单，帮助模型先覆盖所有文件族。
+ *
+ * @param {{status:string,filePath:string}[]} changedFiles Reviewable changed files.
+ * @param {number} [maxFiles=40] Maximum entries in the brief.
+ * @returns {string} Compact changed-file list.
+ */
+function buildChangedFilesBrief(changedFiles, maxFiles = 80) {
+  if (changedFiles.length === 0) {
+    return "- 未检测到待审变更文件";
+  }
+
+  const lines = changedFiles
+    .slice(0, maxFiles)
+    .map((change, index) => `${index + 1}. ${change.status} ${change.filePath}`);
+  const omitted = changedFiles.length - lines.length;
+  if (omitted > 0) {
+    lines.push(`... 还有 ${omitted} 个文件未在简报展开；最终报告前必须读取 Changed Files 全量清单。`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Render a bounded must-cover finding list for the brief section.
+ * 中文：生成必须覆盖风险的简表，确保报告不会漏掉关键判断。
+ *
+ * @param {{severity:string,type:string,location:string,evidence:string}[]} findings Priority findings.
+ * @param {number} [maxFindings=15] Maximum entries in the brief.
+ * @returns {string} Compact finding list.
+ */
+function buildPriorityFindingsBrief(findings, maxFindings = 15) {
+  if (findings.length === 0) {
+    return "- 规则预扫未命中高优先级风险；仍需逐个判断待判断文件。";
+  }
+
+  const lines = findings
+    .slice(0, maxFindings)
+    .map((finding, index) => `- ${formatPriorityFindingBrief(finding, index + 1)}`);
+  const omitted = findings.length - lines.length;
+  if (omitted > 0) {
+    lines.push(`- 还有 ${omitted} 个风险未在简报展开；最终报告前必须读取 Priority Findings 全量清单。`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Summarize parsed test evidence for the brief section.
+ * 中文：为简版摘要生成测试证据，避免把 skipped 或未解析结果误读为覆盖率。
+ *
+ * @param {string|null} testCmd Test command.
+ * @param {{status:number}|null} testResult Test command result.
+ * @param {object|null} parsedTestSummary Parsed test summary.
+ * @returns {string} Compact test summary.
+ */
+function buildTestBrief(testCmd, testResult, parsedTestSummary) {
+  if (!testCmd || !testResult) {
+    return "- 测试命令：(未提供)\n- 测试结果：未运行";
+  }
+
+  const parsed = parsedTestSummary
+    ? `总数=${parsedTestSummary.tests ?? "unknown"}，通过=${parsedTestSummary.pass ?? "unknown"}，失败=${parsedTestSummary.fail ?? "unknown"}，跳过=${parsedTestSummary.skipped ?? "unknown"}`
+    : "未解析到结构化统计，需读取 Test Result 原始输出";
+
+  return `- 测试命令：${testCmd}
+- 退出码：${testResult.status}
+- 统计：${parsed}`;
+}
+
+/**
+ * Build the first, compact section the LLM should use before detailed evidence.
+ * 中文：生成首屏简版审查摘要，让模型先抓住完整变更范围和最低结论。
+ * Directory names are not treated as skip signals; every listed changed file is
+ * review evidence and needs a file-level judgment.
+ *
+ * @param {object} input Review evidence inputs.
+ * @param {{status:string,filePath:string}[]} input.changedFiles Reviewable changes.
+ * @param {{severity:string,type:string,location:string,evidence:string}[]} input.priorityFindings Priority findings.
+ * @param {string|null} input.testCmd Test command.
+ * @param {{status:number}|null} input.testResult Test command result.
+ * @param {object|null} input.parsedTestSummary Parsed test summary.
+ * @param {{status:number}} input.diffCheck Diff check result.
+ * @returns {string} Compact Markdown brief.
+ */
+function buildReviewBrief({ changedFiles, priorityFindings, testCmd, testResult, parsedTestSummary, diffCheck }) {
+  const counts = countFindingsBySeverity(priorityFindings);
+  const { minimumRisk, minimumAdvice } = buildDecisionFloor(counts);
+
+  return `先处理本节；后续章节只用于取证、行号和原始输出。
+
+结论下限：
+- 合并建议：${minimumAdvice}
+- 总体风险：至少 ${minimumRisk}
+- 风险计数：P0 >= ${counts.P0}，P1 >= ${counts.P1}，P2 >= ${counts.P2}，P3 >= ${counts.P3}
+
+审查覆盖：
+- 待判断文件数：${changedFiles.length}
+- 下面每个文件都必须进入“变更摘要”，并给出一句文件级判断。
+- 目录名不能作为跳过理由；只要在待判断文件中，就按实际变更审查。
+
+待判断文件：
+${buildChangedFilesBrief(changedFiles)}
+
+必须覆盖风险：
+${buildPriorityFindingsBrief(priorityFindings)}
+
+验证状态：
+${buildTestBrief(testCmd, testResult, parsedTestSummary)}
+- Diff Check 退出码：${diffCheck.status}`;
+}
+
+/**
  * Detect high-priority findings that should drive the final report.
  * 中文：从结构化 diff 和测试摘要中提取必须优先进入报告的风险。
  * This section is placed before the long diff so the model sees hard findings,
@@ -1280,15 +1437,8 @@ function buildPriorityFindings(findings) {
  * @returns {string} Markdown requirement summary.
  */
 function buildReviewDecisionFloor(findings) {
-  const counts = { P0: 0, P1: 0, P2: 0, P3: 0 };
-  for (const finding of findings) {
-    if (Object.prototype.hasOwnProperty.call(counts, finding.severity)) {
-      counts[finding.severity] += 1;
-    }
-  }
-
-  const minimumRisk = counts.P0 > 0 ? "P0" : counts.P1 > 0 ? "P1" : counts.P2 > 0 ? "P2" : counts.P3 > 0 ? "P3" : "P3";
-  const minimumAdvice = counts.P0 > 0 ? "不建议合并" : counts.P1 > 0 ? "补测后合并" : "可合并";
+  const counts = countFindingsBySeverity(findings);
+  const { minimumRisk, minimumAdvice } = buildDecisionFloor(counts);
 
   return `Minimum Overall Risk: ${minimumRisk}
 Minimum Merge Advice: ${minimumAdvice}
@@ -1707,6 +1857,20 @@ Branch: ${branch.stdout.trim() || "(detached or unknown)"}
 Diff base: ${base || "(no HEAD; working tree diff only)"}
 ${buildReviewScopeSummary(ignoredPathList)}
 `);
+
+  parts.push(section("Review Brief", buildReviewBrief({
+    changedFiles,
+    priorityFindings,
+    testCmd,
+    testResult,
+    parsedTestSummary,
+    diffCheck
+  })));
+
+  if (options.briefOnly) {
+    process.stdout.write(parts.join("\n"));
+    return;
+  }
 
   parts.push(section("Report Contract", buildReportContract(testCmd)));
   parts.push(section("Review Decision Floor", buildReviewDecisionFloor(priorityFindings)));
