@@ -55,6 +55,7 @@ function parseArgs(argv) {
   const options = {
     repo: process.cwd(),
     base: "HEAD",
+    scopePaths: [],
     testCmd: null,
     noTests: false,
     maxDiffChars: 120000,
@@ -68,6 +69,9 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--repo") {
       options.repo = readOptionValue(argv, i, arg);
+      i += 1;
+    } else if (arg === "--path" || arg === "--scope") {
+      options.scopePaths.push(readOptionValue(argv, i, arg));
       i += 1;
     } else if (arg === "--base") {
       options.base = readOptionValue(argv, i, arg);
@@ -116,6 +120,7 @@ function printHelp() {
 
 Options:
   --repo <path>             Repository or subdirectory to inspect. Defaults to cwd.
+  --path <path>             Review only this file or directory, plus directly referenced files. Repeatable. Alias: --scope.
   --base <ref>              Diff base ref. Defaults to HEAD.
   --test-cmd "<command>"    Test command to run from the repository root.
   --no-tests                Skip test execution.
@@ -167,23 +172,93 @@ function normalizePathList(paths) {
 }
 
 /**
+ * Check whether a repository-relative path points outside the target repo.
+ * 中文：判断仓库相对路径是否越界，避免用户传入路径逃逸仓库根目录。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string} filePath Repository-relative or user-provided path.
+ * @returns {boolean} True when the resolved path is inside the repository.
+ */
+function isPathInsideRepo(repoRoot, filePath) {
+  const absolute = path.resolve(repoRoot, filePath || ".");
+  const relative = path.relative(repoRoot, absolute);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Normalize user-provided review scope paths against the repository root.
+ * 中文：把用户指定的审查范围转换为仓库相对路径；未指定时表示全仓审查。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string[]} rawPaths User-provided scope paths.
+ * @returns {string[]} Repository-relative scope paths.
+ */
+function normalizeScopePaths(repoRoot, rawPaths) {
+  const normalized = [];
+  for (const rawPath of rawPaths || []) {
+    const absolute = path.resolve(rawPath);
+    const absoluteFromRepo = path.isAbsolute(rawPath)
+      ? absolute
+      : path.resolve(repoRoot, rawPath);
+    const relative = normalizeRepoPath(path.relative(repoRoot, absoluteFromRepo));
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`--path must stay inside the repository: ${rawPath}`);
+    }
+    normalized.push(relative);
+  }
+  return normalizePathList(normalized);
+}
+
+/**
+ * Return whether a file belongs to one of the requested review scopes.
+ * 中文：判断文件是否落在用户指定的审查范围内；没有指定范围时默认全仓匹配。
+ *
+ * @param {string} filePath Repository-relative file path.
+ * @param {string[]} scopePaths Repository-relative scope roots.
+ * @returns {boolean} True when the file is in scope.
+ */
+function isInScope(filePath, scopePaths = []) {
+  const normalized = normalizeRepoPath(filePath);
+  if (scopePaths.length === 0) {
+    return true;
+  }
+
+  return scopePaths.some(scopePath => normalized === scopePath || normalized.startsWith(`${scopePath}/`));
+}
+
+/**
+ * Return whether a file path is covered by an ignored path.
+ * 中文：判断文件是否落在排除路径下。
+ *
+ * @param {string} filePath Repository-relative file path.
+ * @param {string[]} ignoredPaths Repository-relative ignored paths.
+ * @returns {boolean} True when ignored.
+ */
+function isIgnoredPath(filePath, ignoredPaths = []) {
+  const normalized = normalizeRepoPath(filePath);
+  return normalizePathList(ignoredPaths).some(ignoredPath => normalized === ignoredPath || normalized.startsWith(`${ignoredPath}/`));
+}
+
+/**
  * Build scoped Git pathspec arguments from excluded paths.
  * 中文：根据排除路径构造 Git pathspec 参数。
  * The script always reviews the full target repository. Pathspecs are added
  * only when support paths, such as the Skill's own directory, must be excluded.
  *
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @param {string[]} includePaths Optional repository-relative paths to include.
  * @returns {string[]} Git arguments beginning with `--`, or an empty list.
  */
-function buildPathspecArgs(ignoredPaths = []) {
+function buildPathspecArgs(ignoredPaths = [], includePaths = []) {
   const ignores = normalizePathList(ignoredPaths);
-  if (ignores.length === 0) {
+  const includes = normalizePathList(includePaths);
+  if (ignores.length === 0 && includes.length === 0) {
     return [];
   }
 
   return [
     "--",
-    ".",
+    ...(includes.length > 0 ? includes : ["."]),
     ...ignores.map(ignoredPath => `:(exclude)${ignoredPath}`)
   ];
 }
@@ -205,17 +280,19 @@ function quoteCommandArg(value) {
  * 中文：生成和实际 pathspec 参数一致的可读命令片段。
  *
  * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @param {string[]} includePaths Optional repository-relative included paths.
  * @returns {string[]} Display command parts.
  */
-function buildPathspecCommandParts(ignoredPaths = []) {
+function buildPathspecCommandParts(ignoredPaths = [], includePaths = []) {
   const ignores = normalizePathList(ignoredPaths);
-  if (ignores.length === 0) {
+  const includes = normalizePathList(includePaths);
+  if (ignores.length === 0 && includes.length === 0) {
     return [];
   }
 
   return [
     "--",
-    quoteCommandArg("."),
+    ...(includes.length > 0 ? includes.map(includePath => quoteCommandArg(includePath)) : [quoteCommandArg(".")]),
     ...ignores.map(ignoredPath => quoteCommandArg(`:(exclude)${ignoredPath}`))
   ];
 }
@@ -226,10 +303,11 @@ function buildPathspecCommandParts(ignoredPaths = []) {
  *
  * @param {string[]} args Git arguments before pathspecs.
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @param {string[]} includePaths Optional repository-relative paths to include.
  * @returns {string[]} Scoped Git arguments.
  */
-function buildScopedGitArgs(args, ignoredPaths = []) {
-  return [...args, ...buildPathspecArgs(ignoredPaths)];
+function buildScopedGitArgs(args, ignoredPaths = [], includePaths = []) {
+  return [...args, ...buildPathspecArgs(ignoredPaths, includePaths)];
 }
 
 /**
@@ -238,10 +316,11 @@ function buildScopedGitArgs(args, ignoredPaths = []) {
  *
  * @param {string[]} args Git arguments before pathspecs.
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @param {string[]} includePaths Optional repository-relative paths to include.
  * @returns {string} Display command.
  */
-function buildScopedGitCommand(args, ignoredPaths = []) {
-  return ["git", ...args, ...buildPathspecCommandParts(ignoredPaths)].join(" ");
+function buildScopedGitCommand(args, ignoredPaths = [], includePaths = []) {
+  return ["git", ...args, ...buildPathspecCommandParts(ignoredPaths, includePaths)].join(" ");
 }
 
 /**
@@ -370,6 +449,32 @@ function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignore
 }
 
 /**
+ * Build the Review Files section from the final review scope.
+ * 中文：生成最终待判断文件区块，和 diff 变更文件区分开。
+ *
+ * @param {string} command Display command used to collect the base file list.
+ * @param {{status:number, stdout:string, stderr:string, error:string}} result File-list command result.
+ * @param {{status:string,filePath:string,source?:string}[]} reviewFiles Files in review scope.
+ * @param {string[]} scopePaths User-provided scope paths.
+ * @returns {string} Markdown command block for review files.
+ */
+function buildReviewFilesSection(command, result, reviewFiles, scopePaths = []) {
+  const scopeLine = scopePaths.length > 0
+    ? `Scope mode: specified paths plus direct relative references (${scopePaths.join(", ")})`
+    : "Scope mode: all repository files";
+  const lines = reviewFiles.length > 0
+    ? reviewFiles.map(file => `${file.status || "R"}\t${file.filePath}${file.source ? `\t${file.source}` : ""}`)
+    : ["(no files)"];
+
+  return commandBlock(command, {
+    status: result.status,
+    stdout: [scopeLine, "", ...lines].join("\n"),
+    stderr: result.stderr,
+    error: result.error
+  });
+}
+
+/**
  * Build git diff arguments with optional path exclusions.
  * 中文：构造 git diff 参数，并在统一审查范围内排除 Skill 自身等辅助路径。
  * Pathspecs are applied after `--` so every diff-derived evidence section reads
@@ -378,15 +483,16 @@ function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignore
  * @param {string|null} base Diff base ref, or null for working-tree diff only.
  * @param {string[]} options Git diff options such as `--stat` or `--check`.
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @param {string[]} includePaths Optional repository-relative paths to include.
  * @returns {string[]} Arguments passed to `git`.
  */
-function buildDiffArgs(base, options = [], ignoredPaths = []) {
+function buildDiffArgs(base, options = [], ignoredPaths = [], includePaths = []) {
   const args = ["diff"];
   if (base) {
     args.push(base);
   }
   args.push(...options);
-  return buildScopedGitArgs(args, ignoredPaths);
+  return buildScopedGitArgs(args, ignoredPaths, includePaths);
 }
 
 /**
@@ -398,15 +504,16 @@ function buildDiffArgs(base, options = [], ignoredPaths = []) {
  * @param {string|null} base Diff base ref, or null for working-tree diff only.
  * @param {string[]} options Git diff options.
  * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @param {string[]} includePaths Optional repository-relative included paths.
  * @returns {string} Display command.
  */
-function buildDiffCommand(base, options = [], ignoredPaths = []) {
+function buildDiffCommand(base, options = [], ignoredPaths = [], includePaths = []) {
   const parts = ["git", "diff"];
   if (base) {
     parts.push(base);
   }
   parts.push(...options);
-  return [...parts, ...buildPathspecCommandParts(ignoredPaths)].join(" ");
+  return [...parts, ...buildPathspecCommandParts(ignoredPaths, includePaths)].join(" ");
 }
 
 /**
@@ -495,6 +602,297 @@ function parseUntrackedLines(untrackedOutput) {
 }
 
 /**
+ * Parse one-path-per-line Git output into repository-relative paths.
+ * 中文：把 Git 文件列表输出解析为仓库相对路径列表。
+ *
+ * @param {string} output Raw command output.
+ * @returns {string[]} Normalized paths.
+ */
+function parsePathLines(output) {
+  return normalizePathList(
+    String(output || "")
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+  );
+}
+
+/**
+ * Build review-file records from repository paths.
+ * 中文：把仓库文件路径转换为待审查文件记录。
+ *
+ * @param {string[]} filePaths Repository-relative file paths.
+ * @param {string} source Source label.
+ * @returns {{status:string,filePath:string,source:string}[]} Review file records.
+ */
+function buildReviewFileRecords(filePaths, source) {
+  return filePaths.map(filePath => ({
+    status: "R",
+    filePath,
+    source
+  }));
+}
+
+/**
+ * Collect tracked and untracked files that can be reviewed as text.
+ * 中文：收集仓库中可作为文本审查的跟踪文件和未跟踪文件。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @param {string[]} includePaths Optional repository-relative included paths.
+ * @returns {{files:string[], command:string, result:{status:number,stdout:string,stderr:string,error:string}}} File list evidence.
+ */
+function collectRepositoryFiles(repoRoot, ignoredPaths = [], includePaths = []) {
+  const trackedArgs = buildScopedGitArgs(["ls-files"], ignoredPaths, includePaths);
+  const untrackedArgs = buildScopedGitArgs(["ls-files", "--others", "--exclude-standard"], ignoredPaths, includePaths);
+  const tracked = runGit(trackedArgs, repoRoot);
+  const untracked = runGit(untrackedArgs, repoRoot);
+  const files = normalizePathList([
+    ...parsePathLines(tracked.stdout),
+    ...parsePathLines(untracked.stdout)
+  ]).filter(filePath => looksTextLike(filePath) && !isIgnoredPath(filePath, ignoredPaths));
+
+  return {
+    files,
+    command: `${buildScopedGitCommand(["ls-files"], ignoredPaths, includePaths)} + ${buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], ignoredPaths, includePaths)}`,
+    result: combineCommandResults(tracked, untracked)
+  };
+}
+
+/**
+ * Return whether a directory name is noisy for repository-wide filesystem scans.
+ * 中文：判断目录是否应从全仓文件系统扫描中跳过。
+ *
+ * @param {string} name Directory basename.
+ * @returns {boolean} True when directory should be skipped.
+ */
+function isNoisyDirectoryName(name) {
+  return new Set([
+    ".git", ".hg", ".svn", "node_modules", "dist", "build", "coverage", ".next", ".cache"
+  ]).has(name);
+}
+
+/**
+ * Return whether a path is part of this Skill's support implementation.
+ * 中文：判断路径是否为当前 Skill 的支撑实现；外层仓库默认审查时需要排除。
+ *
+ * @param {string} filePath Repository-relative path.
+ * @param {string|null} skillRelativePath Current Skill root relative to the reviewed repo.
+ * @returns {boolean} True when the path is Skill support rather than user/demo code.
+ */
+function isOwnSkillSupportPath(filePath, skillRelativePath) {
+  const normalized = normalizeRepoPath(filePath);
+  const skillRoot = normalizeRepoPath(skillRelativePath);
+  if (!skillRoot) {
+    return false;
+  }
+
+  return normalized === `${skillRoot}/SKILL.md`
+    || normalized.startsWith(`${skillRoot}/scripts/`)
+    || normalized.startsWith(`${skillRoot}/references/`);
+}
+
+/**
+ * Walk repository files directly from the filesystem.
+ * 中文：直接从文件系统遍历仓库文件，用于展开 Git 子仓库里的示例目录。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @param {string[]} includePaths Optional repository-relative included paths.
+ * @returns {string[]} Text-like repository-relative files.
+ */
+function collectFilesystemFiles(repoRoot, ignoredPaths = [], includePaths = []) {
+  const files = [];
+  const includes = normalizePathList(includePaths);
+  const shouldInclude = filePath => includes.length === 0 || isInScope(filePath, includes);
+
+  const visit = absoluteDir => {
+    const relativeDir = normalizeRepoPath(path.relative(repoRoot, absoluteDir));
+    const baseName = path.basename(absoluteDir);
+    if (isNoisyDirectoryName(baseName) || (relativeDir && isIgnoredPath(relativeDir, ignoredPaths))) {
+      return;
+    }
+
+    for (const entry of fs.readdirSync(absoluteDir, { withFileTypes: true })) {
+      const absolute = path.join(absoluteDir, entry.name);
+      const relative = normalizeRepoPath(path.relative(repoRoot, absolute));
+      if (!relative || isIgnoredPath(relative, ignoredPaths)) {
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        visit(absolute);
+        continue;
+      }
+
+      if (!entry.isFile() || !looksTextLike(relative) || !shouldInclude(relative)) {
+        continue;
+      }
+
+      files.push(relative);
+    }
+  };
+
+  visit(repoRoot);
+  return normalizePathList(files);
+}
+
+/**
+ * Filter default full-repository review files for an outer Skill installation.
+ * 中文：外层仓库默认审查时保留用户文件和示例文件，排除 Skill 支撑实现。
+ *
+ * @param {string[]} files Candidate files.
+ * @param {boolean} excludeSkillSupport Whether to drop Skill support files.
+ * @returns {string[]} Filtered files.
+ */
+function filterDefaultReviewFiles(files, skillRelativePath) {
+  return files.filter(filePath => !isOwnSkillSupportPath(filePath, skillRelativePath));
+}
+
+/**
+ * Resolve relative JS/TS import targets to concrete repository files.
+ * 中文：把 JS/TS 相对引用解析成仓库内实际文件路径。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string} fromFile File containing the import.
+ * @param {string} specifier Import or require specifier.
+ * @returns {string[]} Existing target files.
+ */
+function resolveRelativeImport(repoRoot, fromFile, specifier) {
+  if (!specifier.startsWith(".")) {
+    return [];
+  }
+
+  const fromDir = path.dirname(fromFile);
+  const base = normalizeRepoPath(path.join(fromDir, specifier));
+  const candidates = [
+    base,
+    `${base}.js`,
+    `${base}.cjs`,
+    `${base}.mjs`,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.jsx`,
+    `${base}/index.js`,
+    `${base}/index.ts`,
+    `${base}/index.tsx`,
+    `${base}/index.jsx`
+  ];
+
+  return normalizePathList(candidates).filter(candidate => {
+    if (!isPathInsideRepo(repoRoot, candidate)) {
+      return false;
+    }
+    return fs.existsSync(path.resolve(repoRoot, candidate)) && fs.statSync(path.resolve(repoRoot, candidate)).isFile();
+  });
+}
+
+/**
+ * Extract directly referenced repository files from a source file.
+ * 中文：从源文件中提取直接相对引用的仓库文件，作为指定范围的审查扩展。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string} filePath Repository-relative file path.
+ * @returns {string[]} Directly referenced files.
+ */
+function extractDirectReferenceFiles(repoRoot, filePath) {
+  if (!/\.[cm]?[jt]sx?$/i.test(filePath)) {
+    return [];
+  }
+
+  const absolutePath = path.resolve(repoRoot, filePath);
+  if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+    return [];
+  }
+
+  const content = fs.readFileSync(absolutePath, "utf8");
+  const references = [];
+  const patterns = [
+    /\brequire\(\s*["']([^"']+)["']\s*\)/g,
+    /\bimport\s+(?:[^"']+?\s+from\s+)?["']([^"']+)["']/g,
+    /\bexport\s+[^"']*?\s+from\s+["']([^"']+)["']/g
+  ];
+
+  for (const pattern of patterns) {
+    let match = pattern.exec(content);
+    while (match) {
+      references.push(...resolveRelativeImport(repoRoot, filePath, match[1]));
+      match = pattern.exec(content);
+    }
+  }
+
+  return normalizePathList(references);
+}
+
+/**
+ * Expand scoped review files by following direct relative references.
+ * 中文：当用户指定审查范围时，按直接相对引用扩展相关文件。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string[]} seedFiles Initial scoped files.
+ * @param {number} [maxDepth=2] Reference-follow depth.
+ * @returns {string[]} Seed files plus referenced files.
+ */
+function expandReviewFilesByReferences(repoRoot, seedFiles, maxDepth = 2) {
+  const seen = new Set(seedFiles);
+  let frontier = [...seedFiles];
+
+  for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
+    const next = [];
+    for (const filePath of frontier) {
+      for (const referencedFile of extractDirectReferenceFiles(repoRoot, filePath)) {
+        if (seen.has(referencedFile) || !looksTextLike(referencedFile)) {
+          continue;
+        }
+        seen.add(referencedFile);
+        next.push(referencedFile);
+      }
+    }
+    frontier = next;
+  }
+
+  return [...seen];
+}
+
+/**
+ * Build the final review-file set used by the report coverage contract.
+ * 中文：生成最终待判断文件集合；默认全仓，指定路径时限定范围并扩展直接引用。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @param {string[]} scopePaths Repository-relative user scopes.
+ * @returns {{reviewFiles:{status:string,filePath:string,source:string}[], includePaths:string[], command:string, result:{status:number,stdout:string,stderr:string,error:string}}} Review scope evidence.
+ */
+function buildReviewFileScope(repoRoot, ignoredPaths, scopePaths, skillRelativePath = null) {
+  const baseFilesEvidence = collectRepositoryFiles(repoRoot, ignoredPaths, scopePaths);
+  const filesystemFiles = collectFilesystemFiles(repoRoot, ignoredPaths, scopePaths);
+  const candidateFiles = normalizePathList([
+    ...baseFilesEvidence.files,
+    ...filesystemFiles
+  ]);
+  const defaultFilteredFiles = filterDefaultReviewFiles(candidateFiles, scopePaths.length === 0 ? skillRelativePath : null);
+  const scopedFiles = scopePaths.length > 0
+    ? defaultFilteredFiles.filter(filePath => isInScope(filePath, scopePaths))
+    : defaultFilteredFiles;
+  const expandedFiles = scopePaths.length > 0
+    ? expandReviewFilesByReferences(repoRoot, scopedFiles)
+    : scopedFiles;
+  const reviewFiles = buildReviewFileRecords(expandedFiles, scopePaths.length > 0 ? "scope+references" : "repository");
+
+  return {
+    reviewFiles,
+    includePaths: scopePaths.length > 0 ? expandedFiles : [],
+    command: baseFilesEvidence.command,
+    result: {
+      status: baseFilesEvidence.result.status,
+      stdout: expandedFiles.join("\n"),
+      stderr: baseFilesEvidence.result.stderr,
+      error: baseFilesEvidence.result.error
+    }
+  };
+}
+
+/**
  * Merge changed-file records while preserving the first status seen per path.
  * 中文：合并变更文件记录，并按路径去重，避免同一文件重复进入快照和语法检查。
  * Diff records take precedence over untracked records because they contain the
@@ -550,15 +948,13 @@ function isGitlinkPath(repoRoot, filePath) {
 }
 
 /**
- * Determine whether a changed path belongs to this skill package while another
- * repository is being reviewed.
- * 中文：判断变更路径是否属于当前 Skill 自身；审查外层业务仓库时应过滤这些路径。
- * This prevents skill implementation edits from polluting product-code review,
- * but it still allows this repository to review and maintain the skill itself.
+ * Determine whether a changed path belongs to this skill's support files while
+ * another repository is being reviewed.
+ * 中文：判断变更路径是否属于当前 Skill 支撑文件；外层审查时排除实现文件但保留 examples。
  *
  * @param {string} repoRoot Repository root being inspected.
  * @param {string} filePath Repository-relative changed path.
- * @returns {boolean} True when the path points inside this skill package.
+ * @returns {boolean} True when the path points to Skill support files.
  */
 function isOwnSkillPath(repoRoot, filePath) {
   if (!repoRoot || !filePath) {
@@ -573,7 +969,12 @@ function isOwnSkillPath(repoRoot, filePath) {
 
   const absolute = path.resolve(reviewedRoot, filePath);
   const relativeToSkill = path.relative(skillRoot, absolute);
-  return relativeToSkill === "" || (!relativeToSkill.startsWith("..") && !path.isAbsolute(relativeToSkill));
+  if (relativeToSkill.startsWith("..") || path.isAbsolute(relativeToSkill)) {
+    return false;
+  }
+
+  const normalized = normalizeRepoPath(relativeToSkill);
+  return normalized === "SKILL.md" || normalized.startsWith("scripts/") || normalized.startsWith("references/");
 }
 
 /**
@@ -598,6 +999,25 @@ function getOwnSkillIgnoredPath(repoRoot) {
   }
 
   return normalizeRepoPath(relative);
+}
+
+/**
+ * Resolve this Skill's support paths as exclusions when reviewing an outer repo.
+ * 中文：审查外层仓库时，只排除当前 Skill 支撑文件，保留 examples 作为可审查样例项目。
+ *
+ * @param {string} repoRoot Repository root being inspected.
+ * @returns {string[]} Repository-relative support paths to exclude.
+ */
+function getOwnSkillSupportIgnoredPaths(repoRoot) {
+  const skillRelativePath = getOwnSkillIgnoredPath(repoRoot);
+  if (!skillRelativePath) {
+    return [];
+  }
+  return [
+    `${skillRelativePath}/SKILL.md`,
+    `${skillRelativePath}/scripts`,
+    `${skillRelativePath}/references`
+  ];
 }
 
 /**
@@ -651,9 +1071,14 @@ function splitUntrackedFiles(untrackedOutput, repoRoot) {
  * @param {string[]} ignoredPaths Repository-relative excluded paths.
  * @returns {string} One-line scope summary.
  */
-function buildReviewScopeSummary(ignoredPaths) {
+function buildReviewScopeSummary(ignoredPaths, scopePaths = [], skillRelativePath = null) {
   const ignores = normalizePathList(ignoredPaths);
-  return `Review scope: all repository changes${ignores.length > 0 ? ` except ${ignores.join(", ")}` : ""}`;
+  const scopes = normalizePathList(scopePaths);
+  const includeText = scopes.length > 0 ? `specified paths ${scopes.join(", ")} plus direct references` : "all repository files";
+  if (skillRelativePath && scopes.length === 0) {
+    return `Review scope: ${includeText} except Skill support files under ${skillRelativePath}; examples are included`;
+  }
+  return `Review scope: ${includeText}${ignores.length > 0 ? ` except ${ignores.join(", ")}` : ""}`;
 }
 
 /**
@@ -1002,7 +1427,8 @@ function classifySensitiveLine(content) {
   const sensitiveAssignment = /(?:^|[\s,{])([A-Za-z_$][\w$]*(?:key|Key|KEY|token|Token|TOKEN|secret|Secret|SECRET|password|Password|PASSWORD|connectionString|ConnectionString|CONNECTION_STRING))\s*[:=]\s*(.+)$/.exec(content);
   if (sensitiveAssignment) {
     const rhs = sensitiveAssignment[2];
-    if (/(?:\|\||\?\?)\s*["'][^"']+["']/.test(rhs) || /["'][^"']+["']/.test(rhs)) {
+    const literal = rhs.trim().match(/^(?:[^,\n]*?(?:\|\||\?\?)\s*)?["']([^"']+)["']\s*[,;}]?\s*$/);
+    if (literal && !isLowSignalSensitiveValue(literal[1])) {
       return { label: `hardcoded ${sensitiveAssignment[1]}` };
     }
   }
@@ -1016,7 +1442,37 @@ function classifySensitiveLine(content) {
     { label: "connection string", pattern: /\b(mongodb|postgres|mysql|redis):\/\/[^"'\s]+/i }
   ];
 
-  return checks.find(check => check.pattern.test(content)) || null;
+  const matchedCheck = checks.find(check => check.pattern.test(content));
+  if (!matchedCheck) {
+    return null;
+  }
+
+  const direct = content.match(/["']([^"']+)["']/);
+  if (direct && isLowSignalSensitiveValue(direct[1])) {
+    return null;
+  }
+
+  return matchedCheck;
+}
+
+/**
+ * Return whether a quoted value is too generic to be useful as a secret signal.
+ * 中文：判断字符串是否过于普通，不应被当成敏感字面量信号。
+ *
+ * @param {string} value Quoted literal value.
+ * @returns {boolean} True when likely harmless.
+ */
+function isLowSignalSensitiveValue(value) {
+  const normalized = String(value || "").trim();
+  if (/^sk_live_/i.test(normalized)) {
+    return false;
+  }
+  if (normalized.length < 8) {
+    return true;
+  }
+  return /^(Bearer|Basic|Token)\s*$/i.test(normalized)
+    || /^https?:\/\//i.test(normalized)
+    || /^[A-Za-z_$][\w$]*$/.test(normalized);
 }
 
 /**
@@ -1154,17 +1610,17 @@ function formatReviewSignalBrief(signal, index) {
  * @param {number} [maxFiles=40] Maximum entries in the brief.
  * @returns {string} Compact changed-file list.
  */
-function buildChangedFilesBrief(changedFiles, maxFiles = 80) {
-  if (changedFiles.length === 0) {
-    return "- 未检测到待审变更文件";
+function buildReviewFilesBrief(reviewFiles, maxFiles = 120) {
+  if (reviewFiles.length === 0) {
+    return "- 未检测到待判断文件";
   }
 
-  const lines = changedFiles
+  const lines = reviewFiles
     .slice(0, maxFiles)
-    .map((change, index) => `${index + 1}. ${change.status} ${change.filePath}`);
-  const omitted = changedFiles.length - lines.length;
+    .map((file, index) => `${index + 1}. ${file.status || "R"} ${file.filePath}`);
+  const omitted = reviewFiles.length - lines.length;
   if (omitted > 0) {
-    lines.push(`... 还有 ${omitted} 个文件未在简报展开；最终报告前必须读取 Changed Files 全量清单。`);
+    lines.push(`... 还有 ${omitted} 个文件未在简报展开；最终报告前必须读取 Review Files 全量清单。`);
   }
   return lines.join("\n");
 }
@@ -1222,7 +1678,7 @@ function buildTestBrief(testCmd, testResult, parsedTestSummary) {
  * review evidence and needs a file-level judgment.
  *
  * @param {object} input Review evidence inputs.
- * @param {{status:string,filePath:string}[]} input.changedFiles Reviewable changes.
+ * @param {{status:string,filePath:string,source?:string}[]} input.reviewFiles Files in review scope.
  * @param {{type:string,location:string,evidence:string}[]} input.reviewSignals Review signals.
  * @param {string|null} input.testCmd Test command.
  * @param {{status:number}|null} input.testResult Test command result.
@@ -1230,7 +1686,7 @@ function buildTestBrief(testCmd, testResult, parsedTestSummary) {
  * @param {{status:number}} input.diffCheck Diff check result.
  * @returns {string} Compact Markdown brief.
  */
-function buildReviewBrief({ changedFiles, reviewSignals, testCmd, testResult, parsedTestSummary, diffCheck }) {
+function buildReviewBrief({ reviewFiles, changedFiles, reviewSignals, testCmd, testResult, parsedTestSummary, diffCheck }) {
   return `先处理本节；后续章节只用于取证、行号和原始输出。
 
 职责边界：
@@ -1238,12 +1694,13 @@ function buildReviewBrief({ changedFiles, reviewSignals, testCmd, testResult, pa
 - 最终风险等级、风险计数和合并建议由 LLM 根据证据与 risk-rubric.md 判断。
 
 审查覆盖：
-- 待判断文件数：${changedFiles.length}
+- 待判断文件数：${reviewFiles.length}
+- 变更文件数：${changedFiles.length}
 - 下面每个文件都必须进入“变更摘要”，并给出一句文件级判断。
 - 目录名不能作为跳过理由；只要在待判断文件中，就按实际变更审查。
 
 待判断文件：
-${buildChangedFilesBrief(changedFiles)}
+${buildReviewFilesBrief(reviewFiles)}
 
 疑似风险信号：
 ${buildReviewSignalsBrief(reviewSignals)}
@@ -1371,6 +1828,91 @@ function detectReviewSignals(diffText, ignoredPaths, parsedTestSummary) {
 }
 
 /**
+ * Detect review signals from the current content of scoped review files.
+ * 中文：从待判断文件的当前内容中提取疑似信号；不依赖 diff，也不判断风险等级。
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {{filePath:string}[]} reviewFiles Files in review scope.
+ * @param {Set<string>} ignoredPaths Paths excluded from detection.
+ * @returns {{type:string,location:string,evidence:string,attention:string}[]} Review signals.
+ */
+function detectCurrentFileSignals(repoRoot, reviewFiles, ignoredPaths = new Set()) {
+  const signals = [];
+  const seen = new Set();
+
+  const addSignal = signal => {
+    const key = signal.dedupeKey || `${signal.type}:${signal.location}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    signals.push(signal);
+  };
+
+  for (const file of reviewFiles) {
+    const filePath = file.filePath;
+    if (!filePath || ignoredPaths.has(filePath) || !shouldScanFileForSignals(filePath)) {
+      continue;
+    }
+
+    const absolutePath = path.resolve(repoRoot, filePath);
+    if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+      continue;
+    }
+
+    const isTestFile = /(^|\/)(test|tests|__tests__)\//i.test(filePath) || /\.test\.[cm]?jsx?$/i.test(filePath) || /\.spec\.[cm]?jsx?$/i.test(filePath);
+    const isSourceFile = !isTestFile;
+    const lines = fs.readFileSync(absolutePath, "utf8").split(/\r?\n/);
+
+    lines.forEach((line, index) => {
+      const lineNumber = index + 1;
+      const sensitive = classifySensitiveLine(line);
+      if (sensitive && isSourceFile) {
+        addSignal({
+          type: "current_sensitive_literal_signal",
+          dedupeKey: `current_sensitive_literal:${filePath}:${lineNumber}`,
+          location: `${filePath}:${lineNumber}`,
+          evidence: `${sensitive.label} | ${extractSensitiveValue(line)} | ${redactSensitiveContent(line.trim())}`,
+          attention: "检查当前文件中是否存在真实密钥、令牌、密码或连接串。"
+        });
+      }
+
+      if (isSourceFile && /\breturn\s+\{\s*ok:\s*true\b/.test(line) && /auth|login|token|permission|access/i.test(filePath)) {
+        addSignal({
+          type: "current_auth_success_return_signal",
+          dedupeKey: `current_auth_success_return:${filePath}:${lineNumber}`,
+          location: `${filePath}:${lineNumber}`,
+          evidence: redactSensitiveContent(line.trim()),
+          attention: "检查该成功返回是否仍受认证、鉴权或权限校验约束。"
+        });
+      }
+
+      if (isSourceFile && /console\.log\(/.test(line) && /auth|token|password|secret|authorization/i.test(line)) {
+        addSignal({
+          type: "current_sensitive_logging_signal",
+          dedupeKey: `current_sensitive_logging:${filePath}:${lineNumber}`,
+          location: `${filePath}:${lineNumber}`,
+          evidence: redactSensitiveContent(line.trim()),
+          attention: "检查日志是否暴露认证、令牌或敏感上下文。"
+        });
+      }
+
+      if (/test\.skip|describe\.skip|it\.skip/.test(line)) {
+        addSignal({
+          type: "current_skipped_test_signal",
+          dedupeKey: `current_skipped_test:${filePath}:${lineNumber}`,
+          location: `${filePath}:${lineNumber}`,
+          evidence: redactSensitiveContent(line.trim()),
+          attention: "检查被跳过测试是否覆盖关键路径，并在测试建议中说明。"
+        });
+      }
+    });
+  }
+
+  return signals;
+}
+
+/**
  * Render review signals or an explicit no-signal message.
  * 中文：渲染疑似风险信号列表；没有发现时也给出明确说明。
  * Keeping this section short and near the top makes it easy to find evidence
@@ -1385,6 +1927,31 @@ function buildReviewSignals(signals) {
   }
 
   return signals.map((signal, index) => formatReviewSignal(signal, index + 1)).join("\n\n");
+}
+
+/**
+ * Merge review signals while preserving first occurrence.
+ * 中文：合并疑似风险信号并去重，避免 diff 和当前文件扫描重复提示同一位置。
+ *
+ * @param {...{type:string,location:string,evidence:string,attention:string}[][]} signalGroups Signal arrays.
+ * @returns {{type:string,location:string,evidence:string,attention:string}[]} Merged signals.
+ */
+function mergeReviewSignals(...signalGroups) {
+  const merged = [];
+  const seen = new Set();
+
+  for (const group of signalGroups) {
+    for (const signal of group || []) {
+      const key = signal.dedupeKey || `${signal.type}:${signal.location}:${signal.evidence}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(signal);
+    }
+  }
+
+  return merged;
 }
 
 /**
@@ -1508,6 +2075,20 @@ function looksTextLike(filePath) {
   ]);
   const ext = path.extname(filePath).toLowerCase();
   return allowedExtensions.has(ext) || path.basename(filePath).includes(".");
+}
+
+/**
+ * Decide whether a file should be scanned for lightweight content signals.
+ * 中文：判断文件是否适合做轻量内容信号扫描，避免文档文字触发代码风险误报。
+ *
+ * @param {string} filePath Repository-relative path.
+ * @returns {boolean} True when code/config signal scanning is useful.
+ */
+function shouldScanFileForSignals(filePath) {
+  const signalExtensions = new Set([
+    ".cjs", ".env", ".js", ".json", ".jsx", ".mjs", ".ts", ".tsx", ".yaml", ".yml"
+  ]);
+  return signalExtensions.has(path.extname(filePath).toLowerCase());
 }
 
 /**
@@ -1740,12 +2321,16 @@ function main() {
   const repoRoot = resolveRepoRoot(options.repo);
   const base = hasHead(repoRoot) ? options.base : null;
   const generatedAt = new Date().toISOString();
-  const staticIgnoredPathList = normalizePathList([getOwnSkillIgnoredPath(repoRoot)].filter(Boolean));
+  const ownSkillIgnoredPath = getOwnSkillIgnoredPath(repoRoot);
+  const staticIgnoredPathList = normalizePathList(getOwnSkillSupportIgnoredPaths(repoRoot));
+  const scopePaths = normalizeScopePaths(repoRoot, options.scopePaths);
+  const reviewScope = buildReviewFileScope(repoRoot, staticIgnoredPathList, scopePaths, ownSkillIgnoredPath);
+  const includePathList = reviewScope.includePaths;
 
   const branch = runGit(["branch", "--show-current"], repoRoot);
-  const status = runGit(buildScopedGitArgs(["status", "--short", "--branch"], staticIgnoredPathList), repoRoot);
-  const untracked = runGit(buildScopedGitArgs(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList), repoRoot);
-  const nameStatus = runGit(buildDiffArgs(base, ["--name-status"], staticIgnoredPathList), repoRoot);
+  const status = runGit(buildScopedGitArgs(["status", "--short", "--branch"], staticIgnoredPathList, includePathList), repoRoot);
+  const untracked = runGit(buildScopedGitArgs(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList, includePathList), repoRoot);
+  const nameStatus = runGit(buildDiffArgs(base, ["--name-status"], staticIgnoredPathList, includePathList), repoRoot);
   const parsedChangedFiles = parseNameStatusLines(nameStatus.stdout);
   const { changes: trackedChanges, ignoredChanges } = splitChangedFiles(parsedChangedFiles, repoRoot);
   const { changes: untrackedChanges, ignoredChanges: ignoredUntrackedChanges } = splitUntrackedFiles(untracked.stdout, repoRoot);
@@ -1757,37 +2342,44 @@ function main() {
     error: ""
   });
   const changedFilesCommand = untrackedChanges.length > 0
-    ? `${buildDiffCommand(base, ["--name-status"], staticIgnoredPathList)} + ${buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList)}`
-    : buildDiffCommand(base, ["--name-status"], staticIgnoredPathList);
+    ? `${buildDiffCommand(base, ["--name-status"], staticIgnoredPathList, includePathList)} + ${buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList, includePathList)}`
+    : buildDiffCommand(base, ["--name-status"], staticIgnoredPathList, includePathList);
   const ignoredPathList = normalizePathList([
     ...staticIgnoredPathList,
-    ...ignoredChanges.map(change => change.filePath),
-    ...ignoredUntrackedChanges.map(change => change.filePath)
+    ...ignoredChanges
+      .map(change => change.filePath)
+      .filter(filePath => !ownSkillIgnoredPath || filePath !== ownSkillIgnoredPath),
+    ...ignoredUntrackedChanges
+      .map(change => change.filePath)
+      .filter(filePath => !ownSkillIgnoredPath || filePath !== ownSkillIgnoredPath)
   ]);
   const ignoredPaths = new Set(ignoredPathList);
-  const trackedDiffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList), repoRoot);
+  const trackedDiffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList, includePathList), repoRoot);
   const untrackedDiffStat = buildUntrackedStat(repoRoot, untrackedChanges);
   const diffStat = combineCommandResults(trackedDiffStat, untrackedDiffStat);
   const diffStatCommand = untrackedChanges.length > 0
-    ? `${buildDiffCommand(base, ["--stat"], ignoredPathList)} + untracked-file stat`
-    : buildDiffCommand(base, ["--stat"], ignoredPathList);
-  const trackedDiffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList), repoRoot);
+    ? `${buildDiffCommand(base, ["--stat"], ignoredPathList, includePathList)} + untracked-file stat`
+    : buildDiffCommand(base, ["--stat"], ignoredPathList, includePathList);
+  const trackedDiffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList, includePathList), repoRoot);
   const untrackedDiffCheck = buildUntrackedDiffCheck(repoRoot, untrackedChanges);
   const diffCheck = combineCommandResults(trackedDiffCheck, untrackedDiffCheck);
   const diffCheckCommand = untrackedChanges.length > 0
-    ? `${buildDiffCommand(base, ["--check"], ignoredPathList)} + untracked-file whitespace check`
-    : buildDiffCommand(base, ["--check"], ignoredPathList);
-  const trackedDiff = runGit(buildDiffArgs(base, [], ignoredPathList), repoRoot);
+    ? `${buildDiffCommand(base, ["--check"], ignoredPathList, includePathList)} + untracked-file whitespace check`
+    : buildDiffCommand(base, ["--check"], ignoredPathList, includePathList);
+  const trackedDiff = runGit(buildDiffArgs(base, [], ignoredPathList, includePathList), repoRoot);
   const untrackedDiff = buildUntrackedDiff(repoRoot, untrackedChanges);
   const fullDiff = combineDiffResults(trackedDiff, untrackedDiff);
   const fullDiffCommand = untrackedChanges.length > 0
-    ? `${buildDiffCommand(base, [], ignoredPathList)} + synthetic untracked-file diff`
-    : buildDiffCommand(base, [], ignoredPathList);
+    ? `${buildDiffCommand(base, [], ignoredPathList, includePathList)} + synthetic untracked-file diff`
+    : buildDiffCommand(base, [], ignoredPathList, includePathList);
 
   const testCmd = options.noTests ? null : options.testCmd || detectDefaultTestCommand(repoRoot);
   const testResult = testCmd ? run(testCmd, [], repoRoot, true) : null;
   const parsedTestSummary = parseTestSummary(testResult);
-  const reviewSignals = detectReviewSignals(fullDiff.stdout || "", ignoredPaths, parsedTestSummary);
+  const reviewSignals = mergeReviewSignals(
+    detectReviewSignals(fullDiff.stdout || "", ignoredPaths, parsedTestSummary),
+    detectCurrentFileSignals(repoRoot, reviewScope.reviewFiles, ignoredPaths)
+  );
 
   const parts = [];
   parts.push(`# CodeFlow Guard Review Context
@@ -1796,10 +2388,11 @@ Generated: ${generatedAt}
 Repository: ${repoRoot}
 Branch: ${branch.stdout.trim() || "(detached or unknown)"}
 Diff base: ${base || "(no HEAD; working tree diff only)"}
-${buildReviewScopeSummary(ignoredPathList)}
+${buildReviewScopeSummary(ignoredPathList, scopePaths, ownSkillIgnoredPath)}
 `);
 
   parts.push(section("Review Brief", buildReviewBrief({
+    reviewFiles: reviewScope.reviewFiles,
     changedFiles,
     reviewSignals,
     testCmd,
@@ -1815,12 +2408,13 @@ ${buildReviewScopeSummary(ignoredPathList)}
 
   parts.push(section("Report Contract", buildReportContract(testCmd)));
   parts.push(section("Review Signals", buildReviewSignals(reviewSignals)));
-  parts.push(section("Repository State", commandBlock(buildScopedGitCommand(["status", "--short", "--branch"], staticIgnoredPathList), status)));
+  parts.push(section("Repository State", commandBlock(buildScopedGitCommand(["status", "--short", "--branch"], staticIgnoredPathList, includePathList), status)));
+  parts.push(section("Review Files", buildReviewFilesSection(reviewScope.command, reviewScope.result, reviewScope.reviewFiles, scopePaths)));
   parts.push(section("Changed Files", buildChangedFilesSection(changedFilesCommand, changedFilesResult, changedFiles, [...ignoredChanges, ...ignoredUntrackedChanges])));
-  parts.push(section("Untracked Files", commandBlock(buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList), untracked)));
+  parts.push(section("Untracked Files", commandBlock(buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList, includePathList), untracked)));
   parts.push(section("Diff Stat", commandBlock(diffStatCommand, diffStat)));
   parts.push(section("Diff Check", commandBlock(diffCheckCommand, diffCheck)));
-  parts.push(section("Syntax Check", buildSyntaxCheck(repoRoot, changedFiles)));
+  parts.push(section("Syntax Check", buildSyntaxCheck(repoRoot, reviewScope.reviewFiles)));
   parts.push(section("Sensitive Literal Findings", buildSensitiveLiteralFindings(fullDiff.stdout || "", ignoredPaths)));
   parts.push(section("Changed Line Anchors", buildChangedLineAnchors(fullDiff.stdout || "", options.maxAnchors, ignoredPaths)));
 
@@ -1832,7 +2426,7 @@ Exit code: ${fullDiff.status}
 ${diffOutput}
 \`\`\``));
 
-  parts.push(section("Current File Snapshots", buildFileSnapshots(repoRoot, changedFiles, options)));
+  parts.push(section("Current File Snapshots", buildFileSnapshots(repoRoot, reviewScope.reviewFiles, options)));
 
   if (testResult) {
     parts.push(section("Test Result", commandBlock(testCmd, testResult)));

@@ -14,10 +14,11 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
    `node scripts/collect-review-context.js`
 2. 如果用户提供测试命令，传入脚本：
    `node scripts/collect-review-context.js --test-cmd "<test command>"`
-3. 如果 Skill 安装在子目录但要审查业务仓库，使用 `--repo "<业务仓库路径>"`；脚本始终审查目标仓库的全部变更，并自动排除 Skill 自身目录。
-4. 如果脚本不可用，再手动运行 `git status --short --branch`、`git diff --stat`、`git diff --name-status`、`git diff --check`、`git diff` 和相关测试命令。
-5. 读取 `references/risk-rubric.md` 判断风险等级。
-6. 读取 `references/output-template.md` 生成最终报告。
+3. 如果 Skill 安装在子目录但要审查业务仓库，使用 `--repo "<业务仓库路径>"`；未指定路径时脚本审查目标仓库全部可审查文件，并自动排除 Skill 自身目录。
+4. 如果用户指定审查范围，使用可重复的 `--path "<文件或目录>"`；脚本只审查指定范围，并自动纳入直接相对引用文件。
+5. 如果脚本不可用，再手动运行 `git status --short --branch`、`git diff --stat`、`git diff --name-status`、`git diff --check`、`git diff` 和相关测试命令。
+6. 读取 `references/risk-rubric.md` 判断风险等级。
+7. 读取 `references/output-template.md` 生成最终报告。
 
 ## 风险等级
 
@@ -29,7 +30,7 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
 ## 输出硬约束
 
 - 使用中文输出。
-- 先把脚本输出中的 `Review Brief` 当作审查任务单：待判断文件必须逐个进入“变更摘要”，疑似风险信号必须逐个核验。
+- 先把脚本输出中的 `Review Brief` 和 `Review Files` 当作审查任务单：待判断文件必须逐个进入“变更摘要”，疑似风险信号必须逐个核验。
 - 目录名不能作为跳过理由；`examples/`、`samples/`、`demo/`、`test/` 等路径只要在待判断文件中，就按实际变更审查。
 - 严格使用 `references/output-template.md` 的分节顺序，不要省略任何必填章节。
 - 脚本只负责收集证据和疑似风险信号；最终风险等级、风险计数和合并建议必须由 LLM 根据 `references/risk-rubric.md` 与上下文判断。
