@@ -4,6 +4,15 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
+/**
+ * Parse command-line arguments into one normalized options object.
+ * This keeps CLI handling centralized so the rest of the script can rely on
+ * typed option fields instead of repeatedly inspecting raw argv values.
+ *
+ * @param {string[]} argv Arguments after `node script.js`.
+ * @returns {object} Script options, including repo path, diff base, test command,
+ * truncation limits, and feature switches.
+ */
 function parseArgs(argv) {
   const options = {
     repo: process.cwd(),
@@ -43,6 +52,13 @@ function parseArgs(argv) {
   return options;
 }
 
+/**
+ * Print CLI usage information for humans running the script manually.
+ * The output documents only stable public flags; internal implementation
+ * details stay out of the help text to keep it short and usable.
+ *
+ * @returns {void}
+ */
 function printHelp() {
   process.stdout.write(`Usage:
   node scripts/collect-review-context.js [options]
@@ -59,6 +75,17 @@ Options:
 `);
 }
 
+/**
+ * Execute an external command and normalize its result.
+ * The script uses this wrapper instead of calling `spawnSync` directly so all
+ * command outputs have the same shape and are safe to render in report blocks.
+ *
+ * @param {string} command Executable or shell command to run.
+ * @param {string[]} args Arguments used when `useShell` is false.
+ * @param {string} cwd Working directory for the command.
+ * @param {boolean} [useShell=false] Whether to execute via the platform shell.
+ * @returns {{status:number, stdout:string, stderr:string, error:string}}
+ */
 function run(command, args, cwd, useShell = false) {
   const result = useShell
     ? spawnSync(command, {
@@ -83,10 +110,28 @@ function run(command, args, cwd, useShell = false) {
   };
 }
 
+/**
+ * Execute a git command with repository-stable settings.
+ * Disabling `core.autocrlf` for these reads reduces line-ending noise in diff
+ * output, which makes later parsing and line anchors more deterministic.
+ *
+ * @param {string[]} args Git arguments without the leading `git`.
+ * @param {string} cwd Repository directory.
+ * @returns {{status:number, stdout:string, stderr:string, error:string}}
+ */
 function runGit(args, cwd) {
   return run("git", ["-c", "core.autocrlf=false", ...args], cwd);
 }
 
+/**
+ * Convert a command result into a Markdown evidence block.
+ * Empty output is made explicit as `(no output)` so the reviewer can distinguish
+ * "command produced nothing" from "the evidence section was omitted".
+ *
+ * @param {string} command Human-readable command label.
+ * @param {{status:number, stdout:string, stderr:string, error:string}} result
+ * @returns {string} Markdown-formatted command block.
+ */
 function commandBlock(command, result) {
   const output = [result.stdout.trim(), result.stderr.trim(), result.error.trim()]
     .filter(Boolean)
@@ -100,6 +145,18 @@ ${body}
 \`\`\``;
 }
 
+/**
+ * Build the Changed Files section after removing noisy gitlink paths.
+ * Git submodules or nested repositories can appear as changed entries but are
+ * not useful for file snapshots or line-level review; they are shown separately
+ * so the report stays transparent without polluting the main changed-file list.
+ *
+ * @param {string} diffCommand Base diff command displayed in the report.
+ * @param {{status:number, stdout:string, stderr:string, error:string}} nameStatusResult Raw git name-status result.
+ * @param {{status:string, filePath:string}[]} changes Reviewable file changes.
+ * @param {{status:string, filePath:string}[]} ignoredGitlinks Filtered gitlink/submodule entries.
+ * @returns {string} Markdown command block for changed files.
+ */
 function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignoredGitlinks) {
   const lines = changes.length > 0
     ? changes.map(change => `${change.status}\t${change.filePath}`)
@@ -121,6 +178,15 @@ function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignore
   });
 }
 
+/**
+ * Truncate long text while preserving an explicit omission marker.
+ * This prevents large diffs or files from overwhelming the model context while
+ * still making it clear that the evidence was shortened.
+ *
+ * @param {string} text Text to truncate.
+ * @param {number} maxChars Maximum number of characters to keep.
+ * @returns {string} Original text or truncated text with an omission notice.
+ */
 function truncate(text, maxChars) {
   if (!Number.isFinite(maxChars) || maxChars <= 0 || text.length <= maxChars) {
     return text;
@@ -131,6 +197,14 @@ function truncate(text, maxChars) {
 [diff truncated: ${omitted} characters omitted; rerun with --max-diff-chars for a larger context]`;
 }
 
+/**
+ * Redact sensitive values across a multi-line text block.
+ * It applies the same line-level redaction used by findings to full diffs and
+ * file snapshots, preventing later report generation from copying raw secrets.
+ *
+ * @param {string} text Raw multi-line text.
+ * @returns {string} Text with sensitive literals masked line by line.
+ */
 function redactText(text) {
   return text
     .split(/\r?\n/)
@@ -138,6 +212,14 @@ function redactText(text) {
     .join("\n");
 }
 
+/**
+ * Parse `git diff --name-status` output into structured change records.
+ * Git usually separates status and path with tabs, but the fallback whitespace
+ * parser keeps the script resilient to copied or platform-normalized output.
+ *
+ * @param {string} nameStatusOutput Raw name-status output.
+ * @returns {{status:string, filePath:string}[]} Parsed change records.
+ */
 function parseNameStatusLines(nameStatusOutput) {
   return nameStatusOutput
     .split(/\r?\n/)
@@ -160,6 +242,15 @@ function parseNameStatusLines(nameStatusOutput) {
     });
 }
 
+/**
+ * Determine whether a changed path is a gitlink or nested repository path.
+ * In a parent repository, gitlinks behave like directory entries instead of
+ * normal text files, so they should not be sent through line-based review logic.
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string} filePath Repository-relative path.
+ * @returns {boolean} True when the path points to a directory-style gitlink.
+ */
 function isGitlinkPath(repoRoot, filePath) {
   if (!repoRoot || !filePath) {
     return false;
@@ -178,6 +269,15 @@ function isGitlinkPath(repoRoot, filePath) {
   }
 }
 
+/**
+ * Split parsed changes into reviewable files and ignored gitlink entries.
+ * Deleted files are also excluded from current snapshots because there is no
+ * working-tree file to read; deletion evidence remains available in the diff.
+ *
+ * @param {{status:string, filePath:string}[]} changes Parsed name-status records.
+ * @param {string} repoRoot Repository root for gitlink detection.
+ * @returns {{changes:{status:string,filePath:string}[], ignoredGitlinks:{status:string,filePath:string}[]}}
+ */
 function splitChangedFiles(changes, repoRoot) {
   const kept = [];
   const ignoredGitlinks = [];
@@ -198,6 +298,14 @@ function splitChangedFiles(changes, repoRoot) {
   return { changes: kept, ignoredGitlinks };
 }
 
+/**
+ * Build the final-report contract injected into the collected context.
+ * This gives the reviewing model a compact checklist of hard output rules close
+ * to the evidence, reducing drift from the separate SKILL and template files.
+ *
+ * @param {string|null} testCmd Test command included in the context, if any.
+ * @returns {string} Human-readable report contract.
+ */
 function buildReportContract(testCmd) {
   return `Final review output must include these top-level sections in order:
 
@@ -222,6 +330,17 @@ Hard requirements:
 - If skipped tests are present, list them as test risks.`;
 }
 
+/**
+ * Parse unified diff hunks into `path:line` anchors for changed lines.
+ * Added lines use current-file line numbers; deleted lines use old line numbers
+ * and are marked as deleted so the report does not invent current locations.
+ * Added-line content is redacted before output.
+ *
+ * @param {string} diffText Raw unified diff.
+ * @param {number} maxAnchors Maximum anchors to emit.
+ * @param {Set<string>} [ignoredPaths=new Set()] Paths excluded from line anchors.
+ * @returns {string} Newline-separated changed-line anchors.
+ */
 function buildChangedLineAnchors(diffText, maxAnchors, ignoredPaths = new Set()) {
   const anchors = [];
   const lines = diffText.split(/\r?\n/);
@@ -288,6 +407,14 @@ function buildChangedLineAnchors(diffText, maxAnchors, ignoredPaths = new Set())
   return anchors.join("\n");
 }
 
+/**
+ * Mask a sensitive value while keeping enough shape for review evidence.
+ * Short values are left unchanged because aggressive masking can erase all
+ * signal; longer values keep a small prefix and suffix for traceability.
+ *
+ * @param {string} value Sensitive literal value.
+ * @returns {string} Masked value.
+ */
 function maskSensitiveValue(value) {
   if (!value || value.length <= 8) {
     return value;
@@ -295,6 +422,14 @@ function maskSensitiveValue(value) {
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
+/**
+ * Redact common secret, token, password, API key, and connection-string forms.
+ * The function is intentionally regex-based because it is applied to diff text,
+ * snapshots, and snippets where a full language parser is not always available.
+ *
+ * @param {string} content One line or snippet of source text.
+ * @returns {string} Content with sensitive portions masked.
+ */
 function redactSensitiveContent(content) {
   let redacted = content.replace(
     /\b((?:mongodb|postgres|mysql|redis):\/\/[^:\s"']+:)([^@\s"']+)(@[^\s"']+)/gi,
@@ -309,6 +444,14 @@ function redactSensitiveContent(content) {
   );
 }
 
+/**
+ * Classify whether an added line contains a sensitive literal.
+ * It detects both direct assignments (`token: "..."`) and fallback assignments
+ * (`env.TOKEN || "..."`), then returns a label suitable for risk reporting.
+ *
+ * @param {string} content Added diff line without the leading `+`.
+ * @returns {{label:string}|null} Classification result, or null when harmless.
+ */
 function classifySensitiveLine(content) {
   const sensitiveAssignment = /(?:^|[\s,{])([A-Za-z_$][\w$]*(?:key|Key|KEY|token|Token|TOKEN|secret|Secret|SECRET|password|Password|PASSWORD|connectionString|ConnectionString|CONNECTION_STRING))\s*[:=]\s*(.+)$/.exec(content);
   if (sensitiveAssignment) {
@@ -330,6 +473,14 @@ function classifySensitiveLine(content) {
   return checks.find(check => check.pattern.test(content)) || null;
 }
 
+/**
+ * Extract the masked evidence value for a sensitive finding.
+ * Connection strings are handled first so password-bearing URIs get specialized
+ * redaction instead of a generic quoted-string mask.
+ *
+ * @param {string} content Source line containing a sensitive literal.
+ * @returns {string} Masked evidence value.
+ */
 function extractSensitiveValue(content) {
   const uri = content.match(/\b(?:mongodb|postgres|mysql|redis):\/\/[^\s"']+/i);
   if (uri) {
@@ -342,6 +493,15 @@ function extractSensitiveValue(content) {
   return "(value not extracted)";
 }
 
+/**
+ * Build line-level findings for newly added sensitive literals.
+ * Only added diff lines are considered because the goal is to flag secrets
+ * introduced by the current change, not pre-existing removed values.
+ *
+ * @param {string} diffText Raw unified diff.
+ * @param {Set<string>} [ignoredPaths=new Set()] Paths excluded from findings.
+ * @returns {string} Newline-separated findings or a no-findings message.
+ */
 function buildSensitiveLiteralFindings(diffText, ignoredPaths = new Set()) {
   const findings = [];
   const lines = diffText.split(/\r?\n/);
@@ -398,10 +558,27 @@ function buildSensitiveLiteralFindings(diffText, ignoredPaths = new Set()) {
   return findings.join("\n");
 }
 
+/**
+ * Check whether a path is a JavaScript file that `node --check` can parse.
+ * This intentionally excludes TypeScript and JSX because plain Node syntax
+ * checking would produce false failures without a project-specific compiler.
+ *
+ * @param {string} filePath Repository-relative path.
+ * @returns {boolean} True for `.js`, `.cjs`, or `.mjs` files.
+ */
 function isJavaScriptFile(filePath) {
   return [".js", ".cjs", ".mjs"].includes(path.extname(filePath).toLowerCase());
 }
 
+/**
+ * Run syntax checks for changed JavaScript files.
+ * These results provide explicit evidence before the final report claims a
+ * syntax error, parser failure, or application-startup risk.
+ *
+ * @param {string} repoRoot Repository root where commands should run.
+ * @param {{status:string, filePath:string}[]} changes Reviewable file changes.
+ * @returns {string} Markdown command blocks for syntax checks.
+ */
 function buildSyntaxCheck(repoRoot, changes) {
   const jsFiles = changes
     .map(change => change.filePath)
@@ -417,6 +594,14 @@ function buildSyntaxCheck(repoRoot, changes) {
   }).join("\n\n");
 }
 
+/**
+ * Decide whether a file is safe and useful to snapshot as text.
+ * The extension allowlist avoids binary or irrelevant files while still
+ * covering common source, config, documentation, and data formats.
+ *
+ * @param {string} filePath Repository-relative path.
+ * @returns {boolean} True when the path looks like text.
+ */
 function looksTextLike(filePath) {
   const allowedExtensions = new Set([
     ".cjs", ".css", ".csv", ".env", ".go", ".html", ".java", ".js", ".json",
@@ -427,6 +612,16 @@ function looksTextLike(filePath) {
   return allowedExtensions.has(ext) || path.basename(filePath).includes(".");
 }
 
+/**
+ * Read a changed file and add stable line numbers for review.
+ * The path is resolved against the repo root and validated to prevent accidental
+ * reads outside the repository. File content is redacted before numbering.
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {string} filePath Repository-relative file path.
+ * @param {number} maxChars Snapshot truncation limit.
+ * @returns {string} Numbered file content or a skip reason.
+ */
 function readNumberedFile(repoRoot, filePath, maxChars) {
   const absolutePath = path.resolve(repoRoot, filePath);
   const relativeRoot = path.relative(repoRoot, absolutePath);
@@ -453,6 +648,16 @@ function readNumberedFile(repoRoot, filePath, maxChars) {
   return truncate(numbered, maxChars);
 }
 
+/**
+ * Build current-file snapshots for a bounded set of changed files.
+ * Snapshots complement diff anchors by showing surrounding current code with
+ * line numbers, but the file count limit prevents excessive context growth.
+ *
+ * @param {string} repoRoot Repository root.
+ * @param {{status:string, filePath:string}[]} changes Reviewable file changes.
+ * @param {object} options Runtime options containing snapshot limits.
+ * @returns {string} Markdown snapshots.
+ */
 function buildFileSnapshots(repoRoot, changes, options) {
   const scopedChanges = changes.slice(0, options.maxFiles);
   if (scopedChanges.length === 0) {
@@ -475,6 +680,14 @@ ${numbered}
   return snapshots.join("\n\n");
 }
 
+/**
+ * Parse Node.js test-runner summary lines.
+ * The parser focuses on stable counts (`tests`, `pass`, `fail`, `skipped`,
+ * `todo`) so the final report can distinguish skipped tests from coverage.
+ *
+ * @param {string} output Combined stdout and stderr from a test command.
+ * @returns {object|null} Parsed summary counts, or null if unavailable.
+ */
 function parseNodeTestSummary(output) {
   const summary = {};
   const patterns = {
@@ -495,6 +708,14 @@ function parseNodeTestSummary(output) {
   return Object.keys(summary).length > 0 ? summary : null;
 }
 
+/**
+ * Build a compact parsed test summary for the review context.
+ * When skipped tests are present, the warning explicitly prevents treating
+ * pass/skipped ratios as coverage evidence.
+ *
+ * @param {{stdout:string, stderr:string}|null} testResult Raw test command result.
+ * @returns {string} Parsed test summary or fallback guidance.
+ */
 function buildParsedTestSummary(testResult) {
   if (!testResult) {
     return "No test command was provided or detected.";
@@ -518,6 +739,14 @@ Skipped: ${skipped}
 Todo: ${nodeSummary.todo ?? "unknown"}${warning}`;
 }
 
+/**
+ * Resolve an arbitrary starting directory to its git repository root.
+ * Failing early here prevents later git and file operations from producing
+ * misleading empty evidence outside a repository.
+ *
+ * @param {string} startDir User-provided repo or subdirectory.
+ * @returns {string} Absolute git repository root.
+ */
 function resolveRepoRoot(startDir) {
   const resolved = path.resolve(startDir);
   const rootResult = runGit(["rev-parse", "--show-toplevel"], resolved);
@@ -527,10 +756,26 @@ function resolveRepoRoot(startDir) {
   return rootResult.stdout.trim();
 }
 
+/**
+ * Check whether the repository has a valid HEAD commit.
+ * Newly initialized repositories may not have HEAD yet, so diff command
+ * selection must handle that case explicitly.
+ *
+ * @param {string} repoRoot Repository root.
+ * @returns {boolean} True when HEAD exists.
+ */
 function hasHead(repoRoot) {
   return runGit(["rev-parse", "--verify", "HEAD"], repoRoot).status === 0;
 }
 
+/**
+ * Detect a default npm test command from package.json.
+ * This provides a useful zero-configuration path while still allowing users to
+ * override tests with `--test-cmd` or disable them with `--no-tests`.
+ *
+ * @param {string} repoRoot Repository root.
+ * @returns {string|null} `npm test` when available, otherwise null.
+ */
 function detectDefaultTestCommand(repoRoot) {
   const packageJson = path.join(repoRoot, "package.json");
   if (!fs.existsSync(packageJson)) {
@@ -545,6 +790,15 @@ function detectDefaultTestCommand(repoRoot) {
   }
 }
 
+/**
+ * Render a named Markdown section with consistent spacing.
+ * Keeping section formatting centralized prevents subtle Markdown layout
+ * regressions as evidence sections are added or reordered.
+ *
+ * @param {string} title Section title.
+ * @param {string} content Section body.
+ * @returns {string} Markdown section.
+ */
 function section(title, content) {
   return `## ${title}
 
@@ -552,6 +806,14 @@ ${content}
 `;
 }
 
+/**
+ * Collect all review evidence and print a single Markdown context document.
+ * The function orchestrates git state, diff evidence, syntax checks, sensitive
+ * literal findings, file snapshots, tests, and parsed summaries in a fixed
+ * order so downstream review output is stable and auditable.
+ *
+ * @returns {void}
+ */
 function main() {
   const options = parseArgs(process.argv.slice(2));
   const repoRoot = resolveRepoRoot(options.repo);
