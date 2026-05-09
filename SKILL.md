@@ -23,7 +23,7 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
 审查本仓库自带 Demo 时，使用：
 
 ```bash
-node scripts/collect-review-context.js --test-cmd "npm test --prefix examples/demo-project"
+node scripts/collect-review-context.js --demo-project
 ```
 
 ## 风险等级

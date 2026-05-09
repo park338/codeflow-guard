@@ -9,6 +9,9 @@ const { spawnSync } = require("node:child_process");
  * 中文：解析命令行参数，统一生成脚本后续使用的配置对象。
  * This keeps CLI handling centralized so the rest of the script can rely on
  * typed option fields instead of repeatedly inspecting raw argv values.
+ * `--demo-project` deliberately resolves the repository from this script's
+ * location, so the bundled demo is reviewed correctly even when the caller's
+ * current working directory is an outer repository.
  *
  * @param {string[]} argv Arguments after `node script.js`.
  * @returns {object} Script options, including repo path, diff base, test command,
@@ -20,6 +23,7 @@ function parseArgs(argv) {
     base: "HEAD",
     testCmd: null,
     noTests: false,
+    demoProject: false,
     maxDiffChars: 120000,
     maxFileChars: 20000,
     maxFiles: 20,
@@ -30,6 +34,9 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--repo") {
       options.repo = argv[++i];
+    } else if (arg === "--demo-project") {
+      options.demoProject = true;
+      options.repo = path.resolve(__dirname, "..");
     } else if (arg === "--base") {
       options.base = argv[++i];
     } else if (arg === "--test-cmd") {
@@ -50,6 +57,10 @@ function parseArgs(argv) {
     }
   }
 
+  if (options.demoProject && !options.noTests && !options.testCmd) {
+    options.testCmd = "npm test --prefix examples/demo-project";
+  }
+
   return options;
 }
 
@@ -67,6 +78,7 @@ function printHelp() {
 
 Options:
   --repo <path>             Repository or subdirectory to inspect. Defaults to cwd.
+  --demo-project            Inspect this skill's bundled examples/demo-project regardless of cwd.
   --base <ref>              Diff base ref. Defaults to HEAD.
   --test-cmd "<command>"    Test command to run from the repository root.
   --no-tests                Skip test execution.
