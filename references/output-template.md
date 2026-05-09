@@ -21,6 +21,7 @@
 - 采集命令：
 - 测试命令：
 - Diff 检查：
+- Syntax 检查：
 
 ## Top 3 必须修复项
 
@@ -54,6 +55,8 @@
 不要使用宽表格列出关键风险。每个关键风险标题必须包含 `path:line`。如果只能确认删除行，写 `path:旧行号（删除行）`。
 
 `Sensitive Literal Findings` 中的每一项都必须出现在本节，并计入风险计数。hardcoded key/token/secret/password/connection string 默认 P0，除非上下文证明只是无害测试 fixture。
+
+敏感证据必须脱敏；语法错误类结论必须引用 `Syntax Check`、测试输出或构建输出中的失败证据。
 
 ## 测试建议
 

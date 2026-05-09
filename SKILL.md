@@ -45,9 +45,11 @@ node scripts/collect-review-context.js --test-cmd "npm test --prefix examples/de
 - Top 3 和每个关键风险标题必须包含 `path:line`；如果是删除行导致的风险，使用 `path:旧行号` 并在证据里标注“删除行”。
 - 如果行号无法确认，只写文件路径和函数名，不要编造行号。
 - `Sensitive Literal Findings` 中的每一项都必须进入“关键风险”和风险计数；其中 hardcoded key/token/secret/password/connection string 默认按 P0 处理，除非上下文证明只是无害测试 fixture。
+- 敏感证据只能引用脚本输出的脱敏值，不要在报告中展示完整密钥、令牌、密码或连接串。
 - Top 3 候选必须优先考虑：认证绕过、硬编码密钥/令牌、数据/资金风险、关键测试被跳过。
 - “测试覆盖率”只能在采集上下文出现 coverage 工具结果时使用；否则只能写“通过/失败/跳过数量”。
 - 发现 `test.skip`、`describe.skip`、`it.skip` 或测试输出存在 skipped 时，必须列为测试风险。
+- 只有 `Syntax Check`、测试输出或构建输出明确失败时，才能写语法错误、解析失败或应用无法启动。
 - 只基于代码变更、测试结果和采集上下文中的证据下结论。
 - 最后给出“可合并 / 补测后合并 / 不建议合并”的判断和复审标准。
 
