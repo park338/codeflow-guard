@@ -56,7 +56,7 @@
 
 不要使用宽表格列出关键风险。每个关键风险标题必须包含 `path:line`。如果只能确认删除行，写 `path:旧行号（删除行）`。
 
-`Sensitive Literal Findings` 中的每一项都必须出现在本节，并计入风险计数。hardcoded key/token/secret/password/connection string 默认 P0，除非上下文证明只是无害测试 fixture。
+`Sensitive Literal Findings` 和 `Review Signals` 是证据来源，不是最终结论。必须结合上下文判断是否进入本节，并据 `risk-rubric.md` 计入风险等级和风险计数。
 
 敏感证据必须脱敏；语法错误类结论必须引用 `Syntax Check`、测试输出或构建输出中的失败证据。
 
@@ -101,7 +101,7 @@ test command here
 - [ ] 是否包含“Top 3 必须修复项”
 - [ ] 是否包含“关键风险”
 - [ ] Top 3 和关键风险标题是否包含 `path:line`
-- [ ] Sensitive Literal Findings 是否全部进入关键风险和风险计数
+- [ ] Sensitive Literal Findings 和 Review Signals 是否已逐项核验
 - [ ] 是否写明测试通过、失败、跳过数量
 - [ ] 是否避免把通过比例写成覆盖率
 - [ ] 是否包含合并前检查清单和复审标准

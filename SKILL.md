@@ -29,10 +29,10 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
 ## 输出硬约束
 
 - 使用中文输出。
-- 先把脚本输出中的 `Review Brief` 当作审查任务单：待判断文件必须逐个进入“变更摘要”，必须覆盖风险逐个进入结论。
+- 先把脚本输出中的 `Review Brief` 当作审查任务单：待判断文件必须逐个进入“变更摘要”，疑似风险信号必须逐个核验。
 - 目录名不能作为跳过理由；`examples/`、`samples/`、`demo/`、`test/` 等路径只要在待判断文件中，就按实际变更审查。
 - 严格使用 `references/output-template.md` 的分节顺序，不要省略任何必填章节。
-- 最终报告不得低于 `Review Brief` 给出的风险等级、合并建议和风险计数下限。
+- 脚本只负责收集证据和疑似风险信号；最终风险等级、风险计数和合并建议必须由 LLM 根据 `references/risk-rubric.md` 与上下文判断。
 - 如果最终报告缺少“审查上下文”“风险计数”“Top 3 必须修复项”“关键风险”“测试建议”“合并前检查清单”“复审标准”中的任一章节，必须在输出前自行重写。
 - 结论区必须一项一行，禁止把“合并建议、总体风险、一句话摘要”挤在同一行。
 - 避免宽表格。关键风险使用卡片式条目，方便窄窗口阅读。
@@ -40,7 +40,7 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
 - 引用仓库根目录下的相对路径。优先使用 `Changed Line Anchors` 和 `Current File Snapshots` 中的当前文件行号。
 - Top 3 和每个关键风险标题必须包含 `path:line`；如果是删除行导致的风险，使用 `path:旧行号` 并在证据里标注“删除行”。
 - 如果行号无法确认，只写文件路径和函数名，不要编造行号。
-- `Sensitive Literal Findings` 中的每一项都必须进入“关键风险”和风险计数；其中 hardcoded key/token/secret/password/connection string 默认按 P0 处理，除非上下文证明只是无害测试 fixture。
+- `Sensitive Literal Findings` 和 `Review Signals` 是证据来源，不是最终结论；必须核验上下文后再决定是否进入“关键风险”和风险计数。
 - 敏感证据只能引用脚本输出的脱敏值，不要在报告中展示完整密钥、令牌、密码或连接串。
 - Top 3 候选必须优先考虑：认证绕过、硬编码密钥/令牌、数据/资金风险、关键测试被跳过。
 - “测试覆盖率”只能在采集上下文出现 coverage 工具结果时使用；否则只能写“通过/失败/跳过数量”。
@@ -55,11 +55,11 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
 
 1. 结论区是否分行展示合并建议、总体风险、摘要、风险计数、测试结果。
 2. `Review Brief` 中每个待判断文件是否都进入“变更摘要”，并给出文件级判断。
-3. `Review Brief` 中每个必须覆盖风险是否进入关键风险或 Top 3 候选，并计入风险计数。
+3. `Review Brief` 中每个疑似风险信号是否都被核验，并在关键风险、测试建议或变更摘要中说明处理结果。
 4. 是否包含审查上下文中的采集命令、测试命令和 Diff 检查结果。
 5. 是否包含 Top 3 必须修复项，且每项都有 `path:line`。
 6. 关键风险是否使用卡片式条目，并包含风险、证据、影响、建议、推荐测试。
-7. `Sensitive Literal Findings` 是否全部进入关键风险和风险计数。
-8. 是否遵守 `Review Brief` 的最低结论和计数下限。
+7. `Sensitive Literal Findings` 是否被逐项核验，且没有展示完整敏感值。
+8. 最终风险等级、风险计数和合并建议是否基于 `risk-rubric.md` 与证据，而不是照抄脚本信号。
 9. 是否明确 skipped 测试数量，且没有误写成覆盖率。
 10. 是否包含合并前检查清单和复审标准。

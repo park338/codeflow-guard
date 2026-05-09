@@ -480,7 +480,7 @@ function parseNameStatusLines(nameStatusOutput) {
  * Parse `git ls-files --others` output into added-file change records.
  * 中文：把未跟踪文件列表转换为新增文件变更记录，确保新文件也进入完整审查链路。
  * These records are merged with diff-derived changes so syntax checks,
- * snapshots, priority findings, and sensitive literal checks do not miss newly
+ * snapshots, review signals, and sensitive literal checks do not miss newly
  * created files that have not been staged yet.
  *
  * @param {string} untrackedOutput Raw untracked-file list from Git.
@@ -855,14 +855,14 @@ function buildReportContract(testCmd) {
 
 优先级：
 1. 先按 Review Brief 做覆盖判断；“待判断文件”里的每个文件都必须进入“变更摘要”并给出判断。
-2. “必须覆盖风险”必须进入 Top 3 或关键风险，并计入风险计数。
-3. 最终结论不得低于 Review Brief 的结论下限；可以更严格。
+2. Review Signals 只是脚本识别出的疑似风险信号，不是最终风险等级。
+3. 最终 P0/P1/P2/P3、风险计数和合并建议由你根据证据与 risk-rubric.md 判断。
 
 硬约束：
 - 结论区一项一行，包含合并建议、总体风险、摘要、风险计数、测试状态和测试结果。
 - 审查上下文必须包含测试命令：${testCmd || "(not provided)"}，以及 Diff Check 结果。
 - Top 3 和关键风险标题使用 path:line；优先取 Changed Line Anchors，再取 Current File Snapshots。
-- Sensitive Literal Findings 全部进入关键风险和风险计数；敏感值只引用脱敏证据。
+- Sensitive Literal Findings 是证据来源；是否进入关键风险及风险等级由你结合上下文判断，敏感值只引用脱敏证据。
 - 没有 coverage 工具输出时，不要把通过/跳过比例写成覆盖率。
 - skipped 测试必须作为测试风险。`;
 }
@@ -1044,7 +1044,7 @@ function extractSensitiveValue(content) {
  * Walk a unified diff and expose added/deleted lines with file and line metadata.
  * 中文：遍历 unified diff，把新增/删除行转换为包含文件和行号的结构化记录。
  * Several higher-level detectors share this parser so line-number behavior stays
- * consistent across priority findings, anchors, and sensitive literal checks.
+ * consistent across review signals, anchors, and sensitive literal checks.
  *
  * @param {string} diffText Raw unified diff.
  * @param {Set<string>} [ignoredPaths=new Set()] Paths excluded from detection.
@@ -1117,63 +1117,33 @@ function parseDiffLineRecords(diffText, ignoredPaths = new Set()) {
 }
 
 /**
- * Convert a priority finding object into a compact Markdown evidence card.
- * 中文：把结构化优先级风险转换为便于 LLM 读取的紧凑证据卡片。
- * The output is intentionally repetitive and explicit so mandatory report
- * actions are hard to miss during final report generation.
+ * Convert a review-signal object into a compact Markdown evidence card.
+ * 中文：把脚本识别出的疑似风险信号转换为证据卡片，不在脚本内判断风险等级。
+ * Signals are hints for the LLM reviewer; they should not be treated as final
+ * severity, risk counts, or merge advice.
  *
- * @param {{severity:string,type:string,location:string,evidence:string,requiredAction:string}} finding Priority finding.
- * @param {number} index One-based finding index.
- * @returns {string} Markdown finding card.
+ * @param {{type:string,location:string,evidence:string,attention:string}} signal Review signal.
+ * @param {number} index One-based signal index.
+ * @returns {string} Markdown signal card.
  */
-function formatPriorityFinding(finding, index) {
-  return `### F${index} ${finding.severity} ${finding.type}
+function formatReviewSignal(signal, index) {
+  return `### S${index} ${signal.type}
 
-- Location: ${finding.location}
-- Evidence: ${finding.evidence}
-- Required report action: ${finding.requiredAction}`;
+- Location: ${signal.location}
+- Evidence: ${signal.evidence}
+- Review attention: ${signal.attention}`;
 }
 
 /**
- * Count priority findings by severity.
- * 中文：按严重等级统计优先级风险，供简版摘要和决策下限复用。
+ * Render a short one-line review signal for the brief section.
+ * 中文：把疑似风险信号渲染成一行摘要，供模型快速定位证据。
  *
- * @param {{severity:string}[]} findings Priority findings.
- * @returns {{P0:number,P1:number,P2:number,P3:number}} Severity counts.
+ * @param {{type:string,location:string,evidence:string}} signal Review signal.
+ * @param {number} index One-based signal index.
+ * @returns {string} Compact signal line.
  */
-function countFindingsBySeverity(findings) {
-  const counts = { P0: 0, P1: 0, P2: 0, P3: 0 };
-  for (const finding of findings) {
-    if (Object.prototype.hasOwnProperty.call(counts, finding.severity)) {
-      counts[finding.severity] += 1;
-    }
-  }
-  return counts;
-}
-
-/**
- * Derive the minimum overall risk and merge advice from finding counts.
- * 中文：根据风险计数推导最低总体风险和最低合并建议。
- *
- * @param {{P0:number,P1:number,P2:number,P3:number}} counts Severity counts.
- * @returns {{minimumRisk:string,minimumAdvice:string}} Decision floor.
- */
-function buildDecisionFloor(counts) {
-  const minimumRisk = counts.P0 > 0 ? "P0" : counts.P1 > 0 ? "P1" : counts.P2 > 0 ? "P2" : counts.P3 > 0 ? "P3" : "P3";
-  const minimumAdvice = counts.P0 > 0 ? "不建议合并" : counts.P1 > 0 ? "补测后合并" : "可合并";
-  return { minimumRisk, minimumAdvice };
-}
-
-/**
- * Render a short one-line priority finding for the brief section.
- * 中文：把优先级风险渲染成一行摘要，降低 LLM 首屏输入复杂度。
- *
- * @param {{severity:string,type:string,location:string,evidence:string}} finding Priority finding.
- * @param {number} index One-based finding index.
- * @returns {string} Compact finding line.
- */
-function formatPriorityFindingBrief(finding, index) {
-  return `${index}. ${finding.severity} ${finding.type} | ${finding.location} | ${finding.evidence}`;
+function formatReviewSignalBrief(signal, index) {
+  return `${index}. ${signal.type} | ${signal.location} | ${signal.evidence}`;
 }
 
 /**
@@ -1200,24 +1170,24 @@ function buildChangedFilesBrief(changedFiles, maxFiles = 80) {
 }
 
 /**
- * Render a bounded must-cover finding list for the brief section.
- * 中文：生成必须覆盖风险的简表，确保报告不会漏掉关键判断。
+ * Render a bounded signal list for the brief section.
+ * 中文：生成疑似风险信号简表，提醒模型重点取证但不替模型定级。
  *
- * @param {{severity:string,type:string,location:string,evidence:string}[]} findings Priority findings.
- * @param {number} [maxFindings=15] Maximum entries in the brief.
- * @returns {string} Compact finding list.
+ * @param {{type:string,location:string,evidence:string}[]} signals Review signals.
+ * @param {number} [maxSignals=15] Maximum entries in the brief.
+ * @returns {string} Compact signal list.
  */
-function buildPriorityFindingsBrief(findings, maxFindings = 15) {
-  if (findings.length === 0) {
-    return "- 规则预扫未命中高优先级风险；仍需逐个判断待判断文件。";
+function buildReviewSignalsBrief(signals, maxSignals = 15) {
+  if (signals.length === 0) {
+    return "- 脚本未识别到疑似风险信号；仍需逐个判断待判断文件。";
   }
 
-  const lines = findings
-    .slice(0, maxFindings)
-    .map((finding, index) => `- ${formatPriorityFindingBrief(finding, index + 1)}`);
-  const omitted = findings.length - lines.length;
+  const lines = signals
+    .slice(0, maxSignals)
+    .map((signal, index) => `- ${formatReviewSignalBrief(signal, index + 1)}`);
+  const omitted = signals.length - lines.length;
   if (omitted > 0) {
-    lines.push(`- 还有 ${omitted} 个风险未在简报展开；最终报告前必须读取 Priority Findings 全量清单。`);
+    lines.push(`- 还有 ${omitted} 个信号未在简报展开；最终报告前必须读取 Review Signals 全量清单。`);
   }
   return lines.join("\n");
 }
@@ -1247,29 +1217,25 @@ function buildTestBrief(testCmd, testResult, parsedTestSummary) {
 
 /**
  * Build the first, compact section the LLM should use before detailed evidence.
- * 中文：生成首屏简版审查摘要，让模型先抓住完整变更范围和最低结论。
+ * 中文：生成首屏简版审查摘要，让模型先抓住完整变更范围和疑似信号。
  * Directory names are not treated as skip signals; every listed changed file is
  * review evidence and needs a file-level judgment.
  *
  * @param {object} input Review evidence inputs.
  * @param {{status:string,filePath:string}[]} input.changedFiles Reviewable changes.
- * @param {{severity:string,type:string,location:string,evidence:string}[]} input.priorityFindings Priority findings.
+ * @param {{type:string,location:string,evidence:string}[]} input.reviewSignals Review signals.
  * @param {string|null} input.testCmd Test command.
  * @param {{status:number}|null} input.testResult Test command result.
  * @param {object|null} input.parsedTestSummary Parsed test summary.
  * @param {{status:number}} input.diffCheck Diff check result.
  * @returns {string} Compact Markdown brief.
  */
-function buildReviewBrief({ changedFiles, priorityFindings, testCmd, testResult, parsedTestSummary, diffCheck }) {
-  const counts = countFindingsBySeverity(priorityFindings);
-  const { minimumRisk, minimumAdvice } = buildDecisionFloor(counts);
-
+function buildReviewBrief({ changedFiles, reviewSignals, testCmd, testResult, parsedTestSummary, diffCheck }) {
   return `先处理本节；后续章节只用于取证、行号和原始输出。
 
-结论下限：
-- 合并建议：${minimumAdvice}
-- 总体风险：至少 ${minimumRisk}
-- 风险计数：P0 >= ${counts.P0}，P1 >= ${counts.P1}，P2 >= ${counts.P2}，P3 >= ${counts.P3}
+职责边界：
+- 脚本只收集证据和疑似信号，不判断 P0/P1/P2/P3，不给合并建议。
+- 最终风险等级、风险计数和合并建议由 LLM 根据证据与 risk-rubric.md 判断。
 
 审查覆盖：
 - 待判断文件数：${changedFiles.length}
@@ -1279,8 +1245,8 @@ function buildReviewBrief({ changedFiles, priorityFindings, testCmd, testResult,
 待判断文件：
 ${buildChangedFilesBrief(changedFiles)}
 
-必须覆盖风险：
-${buildPriorityFindingsBrief(priorityFindings)}
+疑似风险信号：
+${buildReviewSignalsBrief(reviewSignals)}
 
 验证状态：
 ${buildTestBrief(testCmd, testResult, parsedTestSummary)}
@@ -1288,28 +1254,28 @@ ${buildTestBrief(testCmd, testResult, parsedTestSummary)}
 }
 
 /**
- * Detect high-priority findings that should drive the final report.
- * 中文：从结构化 diff 和测试摘要中提取必须优先进入报告的风险。
- * This section is placed before the long diff so the model sees hard findings,
- * required severity, and required report actions before lower-priority context.
+ * Detect review signals that may deserve closer attention.
+ * 中文：从结构化 diff 和测试摘要中提取疑似风险信号，但不判断风险等级。
+ * The LLM reviewer must use these as evidence pointers only; final severity,
+ * risk counts, and merge advice are decided from the full context and rubric.
  *
  * @param {string} diffText Raw unified diff.
  * @param {Set<string>} ignoredPaths Paths excluded from detection.
  * @param {object|null} parsedTestSummary Parsed test counts.
- * @returns {{severity:string,type:string,location:string,evidence:string,requiredAction:string}[]} Priority findings.
+ * @returns {{type:string,location:string,evidence:string,attention:string}[]} Review signals.
  */
-function detectPriorityFindings(diffText, ignoredPaths, parsedTestSummary) {
+function detectReviewSignals(diffText, ignoredPaths, parsedTestSummary) {
   const records = parseDiffLineRecords(diffText, ignoredPaths);
-  const findings = [];
+  const signals = [];
   const seen = new Set();
 
-  const addFinding = finding => {
-    const key = finding.dedupeKey || `${finding.type}:${finding.location}`;
+  const addSignal = signal => {
+    const key = signal.dedupeKey || `${signal.type}:${signal.location}`;
     if (seen.has(key)) {
       return;
     }
     seen.add(key);
-    findings.push(finding);
+    signals.push(signal);
   };
 
   for (const record of records) {
@@ -1322,46 +1288,42 @@ function detectPriorityFindings(diffText, ignoredPaths, parsedTestSummary) {
 
     const sensitive = classifySensitiveLine(record.content);
     if (sensitive && isSourceFile) {
-      addFinding({
-        severity: "P0",
-        type: "hardcoded_sensitive_literal",
+      addSignal({
+        type: "sensitive_literal_signal",
         dedupeKey: `hardcoded_sensitive_literal:${record.filePath}:${record.lineNumber}`,
         location: `${record.filePath}:${record.lineNumber}`,
         evidence: `${sensitive.label} | ${extractSensitiveValue(record.content)} | ${redactSensitiveContent(record.content.trim())}`,
-        requiredAction: "必须进入关键风险、风险计数和 Top 3 候选；合并建议不得高于“不建议合并”。"
+        attention: "检查是否为真实密钥、令牌、密码或连接串；最终等级由上下文决定。"
       });
     }
 
     if (isSourceFile && /\breturn\s+\{\s*ok:\s*true\b/.test(record.content) && /auth|login|token|permission|access/i.test(record.filePath)) {
-      addFinding({
-        severity: "P0",
-        type: "auth_bypass",
+      addSignal({
+        type: "auth_success_return_signal",
         dedupeKey: `auth_bypass:${record.filePath}`,
         location: `${record.filePath}:${record.lineNumber}`,
         evidence: redactSensitiveContent(record.content.trim()),
-        requiredAction: "必须进入关键风险和风险计数；总体风险至少 P0；合并建议必须为“不建议合并”。"
+        attention: "检查该成功返回是否仍受认证、鉴权或权限校验约束。"
       });
     }
 
     if (isSourceFile && /console\.log\(/.test(record.content) && /auth|token|password|secret|authorization/i.test(record.content)) {
-      addFinding({
-        severity: "P1",
-        type: "sensitive_auth_logging",
+      addSignal({
+        type: "sensitive_logging_signal",
         dedupeKey: `sensitive_auth_logging:${record.filePath}`,
         location: `${record.filePath}:${record.lineNumber}`,
         evidence: redactSensitiveContent(record.content.trim()),
-        requiredAction: "必须进入关键风险或测试建议；说明日志泄露风险。"
+        attention: "检查日志是否暴露认证、令牌或敏感上下文。"
       });
     }
 
     if (/test\.skip|describe\.skip|it\.skip/.test(record.content)) {
-      addFinding({
-        severity: "P1",
-        type: "skipped_critical_test",
+      addSignal({
+        type: "skipped_test_signal",
         dedupeKey: `skipped_critical_test:${record.filePath}:${record.lineNumber}`,
         location: `${record.filePath}:${record.lineNumber}`,
         evidence: redactSensitiveContent(record.content.trim()),
-        requiredAction: "必须进入关键风险和风险计数；测试结果必须写明跳过数量。"
+        attention: "检查被跳过测试是否覆盖关键路径，并在测试建议中说明。"
       });
     }
   }
@@ -1375,75 +1337,54 @@ function detectPriorityFindings(diffText, ignoredPaths, parsedTestSummary) {
     }
 
     if (isSourceFile && /invalid token|missing token|unauthorized|jwtSecret|authorization/i.test(record.content)) {
-      addFinding({
-        severity: "P0",
-        type: "auth_rejection_removed",
+      addSignal({
+        type: "auth_rejection_branch_removed_signal",
         dedupeKey: `auth_rejection_removed:${record.filePath}`,
         location: `${record.filePath}:${record.lineNumber} (deleted)`,
         evidence: redactSensitiveContent(record.content.trim()),
-        requiredAction: "必须进入关键风险和风险计数；总体风险至少 P0。"
+        attention: "检查删除的认证失败分支是否改变安全校验行为。"
       });
     }
 
     if (isSourceFile && /invalid quantity|invalid price|Math\.min|Math\.max|coupon|quantity|unitPrice/i.test(record.content)) {
-      addFinding({
-        severity: "P1",
-        type: "business_validation_removed",
+      addSignal({
+        type: "business_validation_branch_removed_signal",
         dedupeKey: `business_validation_removed:${record.filePath}`,
         location: `${record.filePath}:${record.lineNumber} (deleted)`,
         evidence: redactSensitiveContent(record.content.trim()),
-        requiredAction: "必须进入关键风险或 Top 3 候选；说明订单金额或数据完整性风险。"
+        attention: "检查删除的业务校验是否改变金额、库存、数据完整性或边界条件。"
       });
     }
   }
 
   if (parsedTestSummary && typeof parsedTestSummary.skipped === "number" && parsedTestSummary.skipped > 0) {
-    addFinding({
-      severity: "P1",
-      type: "test_run_has_skips",
+    addSignal({
+      type: "test_run_skip_signal",
       dedupeKey: "test_run_has_skips",
       location: "Parsed Test Summary",
       evidence: `Skipped tests = ${parsedTestSummary.skipped}`,
-      requiredAction: "必须写入测试结果、关键风险或测试建议；不得描述为覆盖率。"
+      attention: "检查跳过数量和关键路径影响；不要把 skipped 描述为覆盖率。"
     });
   }
 
-  return findings;
+  return signals;
 }
 
 /**
- * Render priority findings or an explicit no-findings message.
- * 中文：渲染优先级风险列表；没有发现时也给出明确说明。
- * Keeping this section short and near the top makes it the primary input for
- * final report generation.
+ * Render review signals or an explicit no-signal message.
+ * 中文：渲染疑似风险信号列表；没有发现时也给出明确说明。
+ * Keeping this section short and near the top makes it easy to find evidence
+ * without turning the script into a risk judge.
  *
- * @param {{severity:string,type:string,location:string,evidence:string,requiredAction:string}[]} findings Priority findings.
+ * @param {{type:string,location:string,evidence:string,attention:string}[]} signals Review signals.
  * @returns {string} Markdown section body.
  */
-function buildPriorityFindings(findings) {
-  if (findings.length === 0) {
-    return "No priority findings were detected by rule-based pre-scan. Review the diff and tests normally.";
+function buildReviewSignals(signals) {
+  if (signals.length === 0) {
+    return "No review signals were detected by rule-based pre-scan. Review the changed files, diff, and tests normally.";
   }
 
-  return findings.map((finding, index) => formatPriorityFinding(finding, index + 1)).join("\n\n");
-}
-
-/**
- * Build minimum final-report requirements from priority findings.
- * 中文：根据优先级风险生成最低风险等级、最低合并建议和风险计数下限。
- * The final LLM report may be stricter, but it should not go below these floors.
- *
- * @param {{severity:string}[]} findings Priority findings.
- * @returns {string} Markdown requirement summary.
- */
-function buildReviewDecisionFloor(findings) {
-  const counts = countFindingsBySeverity(findings);
-  const { minimumRisk, minimumAdvice } = buildDecisionFloor(counts);
-
-  return `Minimum Overall Risk: ${minimumRisk}
-Minimum Merge Advice: ${minimumAdvice}
-Required Risk Count Floor: P0 >= ${counts.P0}, P1 >= ${counts.P1}, P2 >= ${counts.P2}, P3 >= ${counts.P3}
-Rule: final report may be stricter than this floor, but must not be less strict.`;
+  return signals.map((signal, index) => formatReviewSignal(signal, index + 1)).join("\n\n");
 }
 
 /**
@@ -1846,7 +1787,7 @@ function main() {
   const testCmd = options.noTests ? null : options.testCmd || detectDefaultTestCommand(repoRoot);
   const testResult = testCmd ? run(testCmd, [], repoRoot, true) : null;
   const parsedTestSummary = parseTestSummary(testResult);
-  const priorityFindings = detectPriorityFindings(fullDiff.stdout || "", ignoredPaths, parsedTestSummary);
+  const reviewSignals = detectReviewSignals(fullDiff.stdout || "", ignoredPaths, parsedTestSummary);
 
   const parts = [];
   parts.push(`# CodeFlow Guard Review Context
@@ -1860,7 +1801,7 @@ ${buildReviewScopeSummary(ignoredPathList)}
 
   parts.push(section("Review Brief", buildReviewBrief({
     changedFiles,
-    priorityFindings,
+    reviewSignals,
     testCmd,
     testResult,
     parsedTestSummary,
@@ -1873,8 +1814,7 @@ ${buildReviewScopeSummary(ignoredPathList)}
   }
 
   parts.push(section("Report Contract", buildReportContract(testCmd)));
-  parts.push(section("Review Decision Floor", buildReviewDecisionFloor(priorityFindings)));
-  parts.push(section("Priority Findings", buildPriorityFindings(priorityFindings)));
+  parts.push(section("Review Signals", buildReviewSignals(reviewSignals)));
   parts.push(section("Repository State", commandBlock(buildScopedGitCommand(["status", "--short", "--branch"], staticIgnoredPathList), status)));
   parts.push(section("Changed Files", buildChangedFilesSection(changedFilesCommand, changedFilesResult, changedFiles, [...ignoredChanges, ...ignoredUntrackedChanges])));
   parts.push(section("Untracked Files", commandBlock(buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList), untracked)));
