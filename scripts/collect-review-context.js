@@ -6,6 +6,7 @@ const { spawnSync } = require("node:child_process");
 
 /**
  * Parse command-line arguments into one normalized options object.
+ * 中文：解析命令行参数，统一生成脚本后续使用的配置对象。
  * This keeps CLI handling centralized so the rest of the script can rely on
  * typed option fields instead of repeatedly inspecting raw argv values.
  *
@@ -54,6 +55,7 @@ function parseArgs(argv) {
 
 /**
  * Print CLI usage information for humans running the script manually.
+ * 中文：输出脚本帮助信息，方便手动运行时查看可用参数。
  * The output documents only stable public flags; internal implementation
  * details stay out of the help text to keep it short and usable.
  *
@@ -77,6 +79,7 @@ Options:
 
 /**
  * Execute an external command and normalize its result.
+ * 中文：执行外部命令，并把返回码、标准输出和错误输出整理成统一结构。
  * The script uses this wrapper instead of calling `spawnSync` directly so all
  * command outputs have the same shape and are safe to render in report blocks.
  *
@@ -112,6 +115,7 @@ function run(command, args, cwd, useShell = false) {
 
 /**
  * Execute a git command with repository-stable settings.
+ * 中文：执行 git 命令，并固定读取配置，减少换行符带来的 diff 噪声。
  * Disabling `core.autocrlf` for these reads reduces line-ending noise in diff
  * output, which makes later parsing and line anchors more deterministic.
  *
@@ -125,6 +129,7 @@ function runGit(args, cwd) {
 
 /**
  * Convert a command result into a Markdown evidence block.
+ * 中文：把命令执行结果转换成 Markdown 证据块，供后续审查报告引用。
  * Empty output is made explicit as `(no output)` so the reviewer can distinguish
  * "command produced nothing" from "the evidence section was omitted".
  *
@@ -147,6 +152,7 @@ ${body}
 
 /**
  * Build the Changed Files section after removing noisy gitlink paths.
+ * 中文：生成变更文件区块，并把 gitlink 或子仓库路径单独过滤展示。
  * Git submodules or nested repositories can appear as changed entries but are
  * not useful for file snapshots or line-level review; they are shown separately
  * so the report stays transparent without polluting the main changed-file list.
@@ -180,6 +186,7 @@ function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignore
 
 /**
  * Truncate long text while preserving an explicit omission marker.
+ * 中文：截断过长文本，并保留明确的省略提示，避免上下文过大。
  * This prevents large diffs or files from overwhelming the model context while
  * still making it clear that the evidence was shortened.
  *
@@ -199,6 +206,7 @@ function truncate(text, maxChars) {
 
 /**
  * Redact sensitive values across a multi-line text block.
+ * 中文：对多行文本逐行脱敏，避免完整密钥或连接串进入报告上下文。
  * It applies the same line-level redaction used by findings to full diffs and
  * file snapshots, preventing later report generation from copying raw secrets.
  *
@@ -214,6 +222,7 @@ function redactText(text) {
 
 /**
  * Parse `git diff --name-status` output into structured change records.
+ * 中文：解析 `git diff --name-status` 输出，得到结构化的变更文件记录。
  * Git usually separates status and path with tabs, but the fallback whitespace
  * parser keeps the script resilient to copied or platform-normalized output.
  *
@@ -244,6 +253,7 @@ function parseNameStatusLines(nameStatusOutput) {
 
 /**
  * Determine whether a changed path is a gitlink or nested repository path.
+ * 中文：判断变更路径是否为 gitlink 或嵌套仓库，避免当作普通文本文件处理。
  * In a parent repository, gitlinks behave like directory entries instead of
  * normal text files, so they should not be sent through line-based review logic.
  *
@@ -271,6 +281,7 @@ function isGitlinkPath(repoRoot, filePath) {
 
 /**
  * Split parsed changes into reviewable files and ignored gitlink entries.
+ * 中文：把变更拆分为可审查文件和需要忽略的 gitlink 条目。
  * Deleted files are also excluded from current snapshots because there is no
  * working-tree file to read; deletion evidence remains available in the diff.
  *
@@ -300,6 +311,7 @@ function splitChangedFiles(changes, repoRoot) {
 
 /**
  * Build the final-report contract injected into the collected context.
+ * 中文：生成最终报告契约，直接放入采集上下文中约束模型输出。
  * This gives the reviewing model a compact checklist of hard output rules close
  * to the evidence, reducing drift from the separate SKILL and template files.
  *
@@ -332,6 +344,7 @@ Hard requirements:
 
 /**
  * Parse unified diff hunks into `path:line` anchors for changed lines.
+ * 中文：从 unified diff 中提取 `path:line` 行锚点，帮助报告引用准确位置。
  * Added lines use current-file line numbers; deleted lines use old line numbers
  * and are marked as deleted so the report does not invent current locations.
  * Added-line content is redacted before output.
@@ -409,6 +422,7 @@ function buildChangedLineAnchors(diffText, maxAnchors, ignoredPaths = new Set())
 
 /**
  * Mask a sensitive value while keeping enough shape for review evidence.
+ * 中文：遮蔽敏感值，同时保留少量前后缀，便于定位同一条证据。
  * Short values are left unchanged because aggressive masking can erase all
  * signal; longer values keep a small prefix and suffix for traceability.
  *
@@ -424,6 +438,7 @@ function maskSensitiveValue(value) {
 
 /**
  * Redact common secret, token, password, API key, and connection-string forms.
+ * 中文：脱敏常见密钥、令牌、密码、API Key 和数据库连接串。
  * The function is intentionally regex-based because it is applied to diff text,
  * snapshots, and snippets where a full language parser is not always available.
  *
@@ -446,6 +461,7 @@ function redactSensitiveContent(content) {
 
 /**
  * Classify whether an added line contains a sensitive literal.
+ * 中文：判断新增代码行是否包含敏感字面量，并给出风险标签。
  * It detects both direct assignments (`token: "..."`) and fallback assignments
  * (`env.TOKEN || "..."`), then returns a label suitable for risk reporting.
  *
@@ -475,6 +491,7 @@ function classifySensitiveLine(content) {
 
 /**
  * Extract the masked evidence value for a sensitive finding.
+ * 中文：从敏感代码行中提取已脱敏的证据值。
  * Connection strings are handled first so password-bearing URIs get specialized
  * redaction instead of a generic quoted-string mask.
  *
@@ -495,6 +512,7 @@ function extractSensitiveValue(content) {
 
 /**
  * Build line-level findings for newly added sensitive literals.
+ * 中文：基于新增 diff 行生成敏感字面量发现列表。
  * Only added diff lines are considered because the goal is to flag secrets
  * introduced by the current change, not pre-existing removed values.
  *
@@ -560,6 +578,7 @@ function buildSensitiveLiteralFindings(diffText, ignoredPaths = new Set()) {
 
 /**
  * Check whether a path is a JavaScript file that `node --check` can parse.
+ * 中文：判断文件是否适合用 `node --check` 做 JavaScript 语法检查。
  * This intentionally excludes TypeScript and JSX because plain Node syntax
  * checking would produce false failures without a project-specific compiler.
  *
@@ -572,6 +591,7 @@ function isJavaScriptFile(filePath) {
 
 /**
  * Run syntax checks for changed JavaScript files.
+ * 中文：对变更的 JavaScript 文件运行语法检查，提供语法类结论证据。
  * These results provide explicit evidence before the final report claims a
  * syntax error, parser failure, or application-startup risk.
  *
@@ -596,6 +616,7 @@ function buildSyntaxCheck(repoRoot, changes) {
 
 /**
  * Decide whether a file is safe and useful to snapshot as text.
+ * 中文：判断文件是否适合作为文本快照读取。
  * The extension allowlist avoids binary or irrelevant files while still
  * covering common source, config, documentation, and data formats.
  *
@@ -614,6 +635,7 @@ function looksTextLike(filePath) {
 
 /**
  * Read a changed file and add stable line numbers for review.
+ * 中文：读取当前文件内容并加上稳定行号，供报告引用当前代码位置。
  * The path is resolved against the repo root and validated to prevent accidental
  * reads outside the repository. File content is redacted before numbering.
  *
@@ -650,6 +672,7 @@ function readNumberedFile(repoRoot, filePath, maxChars) {
 
 /**
  * Build current-file snapshots for a bounded set of changed files.
+ * 中文：为有限数量的变更文件生成当前文件快照，控制上下文规模。
  * Snapshots complement diff anchors by showing surrounding current code with
  * line numbers, but the file count limit prevents excessive context growth.
  *
@@ -682,6 +705,7 @@ ${numbered}
 
 /**
  * Parse Node.js test-runner summary lines.
+ * 中文：解析 Node.js 测试输出中的测试总数、通过、失败、跳过等统计。
  * The parser focuses on stable counts (`tests`, `pass`, `fail`, `skipped`,
  * `todo`) so the final report can distinguish skipped tests from coverage.
  *
@@ -710,6 +734,7 @@ function parseNodeTestSummary(output) {
 
 /**
  * Build a compact parsed test summary for the review context.
+ * 中文：生成简洁的测试统计摘要，并明确 skipped 不能当作覆盖率。
  * When skipped tests are present, the warning explicitly prevents treating
  * pass/skipped ratios as coverage evidence.
  *
@@ -741,6 +766,7 @@ Todo: ${nodeSummary.todo ?? "unknown"}${warning}`;
 
 /**
  * Resolve an arbitrary starting directory to its git repository root.
+ * 中文：把任意起始目录解析为 Git 仓库根目录。
  * Failing early here prevents later git and file operations from producing
  * misleading empty evidence outside a repository.
  *
@@ -758,6 +784,7 @@ function resolveRepoRoot(startDir) {
 
 /**
  * Check whether the repository has a valid HEAD commit.
+ * 中文：检查仓库是否已有 HEAD 提交，用于决定 diff 基准。
  * Newly initialized repositories may not have HEAD yet, so diff command
  * selection must handle that case explicitly.
  *
@@ -770,6 +797,7 @@ function hasHead(repoRoot) {
 
 /**
  * Detect a default npm test command from package.json.
+ * 中文：从 package.json 自动识别默认 npm 测试命令。
  * This provides a useful zero-configuration path while still allowing users to
  * override tests with `--test-cmd` or disable them with `--no-tests`.
  *
@@ -792,6 +820,7 @@ function detectDefaultTestCommand(repoRoot) {
 
 /**
  * Render a named Markdown section with consistent spacing.
+ * 中文：按统一格式渲染 Markdown 区块，保持上下文结构稳定。
  * Keeping section formatting centralized prevents subtle Markdown layout
  * regressions as evidence sections are added or reordered.
  *
@@ -808,6 +837,7 @@ ${content}
 
 /**
  * Collect all review evidence and print a single Markdown context document.
+ * 中文：汇总代码审查所需的全部证据，并输出稳定的 Markdown 上下文文档。
  * The function orchestrates git state, diff evidence, syntax checks, sensitive
  * literal findings, file snapshots, tests, and parsed summaries in a fixed
  * order so downstream review output is stable and auditable.
