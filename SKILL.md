@@ -14,18 +14,10 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
    `node scripts/collect-review-context.js`
 2. 如果用户提供测试命令，传入脚本：
    `node scripts/collect-review-context.js --test-cmd "<test command>"`
-3. 如果 Skill 安装在子目录但要审查业务仓库，使用 `--repo "<业务仓库路径>"`；脚本会排除 Skill 自身目录，保留其余业务代码变更。
+3. 如果 Skill 安装在子目录但要审查业务仓库，使用 `--repo "<业务仓库路径>"`；脚本始终审查目标仓库的全部变更，并自动排除 Skill 自身目录。
 4. 如果脚本不可用，再手动运行 `git status --short --branch`、`git diff --stat`、`git diff --name-status`、`git diff --check`、`git diff` 和相关测试命令。
 5. 读取 `references/risk-rubric.md` 判断风险等级。
 6. 读取 `references/output-template.md` 生成最终报告。
-
-## Demo 项目提示
-
-审查本仓库自带 Demo 时，使用：
-
-```bash
-node scripts/collect-review-context.js --demo-project
-```
 
 ## 风险等级
 

@@ -5,13 +5,47 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 /**
+ * Read the value that must follow a command-line option.
+ * 中文：读取命令行选项后必须跟随的值，缺失时立即报错。
+ * Failing early prevents a later option name from being accidentally consumed as
+ * a repository path, diff base, test command, or numeric limit.
+ *
+ * @param {string[]} argv Arguments after `node script.js`.
+ * @param {number} index Current option index.
+ * @param {string} optionName Option being parsed.
+ * @returns {string} The following argument value.
+ */
+function readOptionValue(argv, index, optionName) {
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new Error(`${optionName} requires a value. Run with --help for usage.`);
+  }
+  return value;
+}
+
+/**
+ * Parse a numeric command-line option with validation.
+ * 中文：解析并校验数值型命令行选项，避免 NaN 或非正数进入后续逻辑。
+ *
+ * @param {string[]} argv Arguments after `node script.js`.
+ * @param {number} index Current option index.
+ * @param {string} optionName Option being parsed.
+ * @returns {number} Positive finite numeric option value.
+ */
+function readPositiveNumberOption(argv, index, optionName) {
+  const rawValue = readOptionValue(argv, index, optionName);
+  const value = Number(rawValue);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${optionName} must be a positive number. Received: ${rawValue}`);
+  }
+  return value;
+}
+
+/**
  * Parse command-line arguments into one normalized options object.
  * 中文：解析命令行参数，统一生成脚本后续使用的配置对象。
  * This keeps CLI handling centralized so the rest of the script can rely on
  * typed option fields instead of repeatedly inspecting raw argv values.
- * `--demo-project` deliberately resolves the repository from this script's
- * location, so the bundled demo is reviewed correctly even when the caller's
- * current working directory is an outer repository.
  *
  * @param {string[]} argv Arguments after `node script.js`.
  * @returns {object} Script options, including repo path, diff base, test command,
@@ -23,44 +57,43 @@ function parseArgs(argv) {
     base: "HEAD",
     testCmd: null,
     noTests: false,
-    demoProject: false,
     maxDiffChars: 120000,
     maxFileChars: 20000,
     maxFiles: 20,
-    maxAnchors: 200,
-    includePaths: []
+    maxAnchors: 200
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--repo") {
-      options.repo = argv[++i];
-    } else if (arg === "--demo-project") {
-      options.demoProject = true;
-      options.repo = path.resolve(__dirname, "..");
-      options.includePaths = ["examples/demo-project"];
+      options.repo = readOptionValue(argv, i, arg);
+      i += 1;
     } else if (arg === "--base") {
-      options.base = argv[++i];
+      options.base = readOptionValue(argv, i, arg);
+      i += 1;
     } else if (arg === "--test-cmd") {
-      options.testCmd = argv[++i];
+      options.testCmd = readOptionValue(argv, i, arg);
+      i += 1;
     } else if (arg === "--no-tests") {
       options.noTests = true;
     } else if (arg === "--max-diff-chars") {
-      options.maxDiffChars = Number(argv[++i]);
+      options.maxDiffChars = readPositiveNumberOption(argv, i, arg);
+      i += 1;
     } else if (arg === "--max-file-chars") {
-      options.maxFileChars = Number(argv[++i]);
+      options.maxFileChars = readPositiveNumberOption(argv, i, arg);
+      i += 1;
     } else if (arg === "--max-files") {
-      options.maxFiles = Number(argv[++i]);
+      options.maxFiles = readPositiveNumberOption(argv, i, arg);
+      i += 1;
     } else if (arg === "--max-anchors") {
-      options.maxAnchors = Number(argv[++i]);
+      options.maxAnchors = readPositiveNumberOption(argv, i, arg);
+      i += 1;
     } else if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
+    } else {
+      throw new Error(`Unknown option: ${arg}. Run with --help for usage.`);
     }
-  }
-
-  if (options.demoProject && !options.noTests && !options.testCmd) {
-    options.testCmd = "npm test --prefix examples/demo-project";
   }
 
   return options;
@@ -80,7 +113,6 @@ function printHelp() {
 
 Options:
   --repo <path>             Repository or subdirectory to inspect. Defaults to cwd.
-  --demo-project            Inspect this skill's bundled examples/demo-project regardless of cwd.
   --base <ref>              Diff base ref. Defaults to HEAD.
   --test-cmd "<command>"    Test command to run from the repository root.
   --no-tests                Skip test execution.
@@ -131,25 +163,23 @@ function normalizePathList(paths) {
 }
 
 /**
- * Build scoped Git pathspec arguments from include and exclude paths.
- * 中文：根据包含路径和排除路径构造 Git pathspec 参数。
- * With no explicit include path, `.` keeps generic mode broad enough to scan all
- * business changes while still allowing Skill support paths to be excluded.
+ * Build scoped Git pathspec arguments from excluded paths.
+ * 中文：根据排除路径构造 Git pathspec 参数。
+ * The script always reviews the full target repository. Pathspecs are added
+ * only when support paths, such as the Skill's own directory, must be excluded.
  *
- * @param {string[]} includedPaths Repository-relative paths to include.
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
  * @returns {string[]} Git arguments beginning with `--`, or an empty list.
  */
-function buildPathspecArgs(includedPaths = [], ignoredPaths = []) {
-  const includes = normalizePathList(includedPaths);
+function buildPathspecArgs(ignoredPaths = []) {
   const ignores = normalizePathList(ignoredPaths);
-  if (includes.length === 0 && ignores.length === 0) {
+  if (ignores.length === 0) {
     return [];
   }
 
   return [
     "--",
-    ...(includes.length > 0 ? includes : ["."]),
+    ".",
     ...ignores.map(ignoredPath => `:(exclude)${ignoredPath}`)
   ];
 }
@@ -167,23 +197,21 @@ function quoteCommandArg(value) {
 }
 
 /**
- * Render display-only pathspec command parts matching `buildPathspecArgs`.
+ * Render display-only exclude pathspec command parts matching `buildPathspecArgs`.
  * 中文：生成和实际 pathspec 参数一致的可读命令片段。
  *
- * @param {string[]} includedPaths Repository-relative included paths.
  * @param {string[]} ignoredPaths Repository-relative excluded paths.
  * @returns {string[]} Display command parts.
  */
-function buildPathspecCommandParts(includedPaths = [], ignoredPaths = []) {
-  const includes = normalizePathList(includedPaths);
+function buildPathspecCommandParts(ignoredPaths = []) {
   const ignores = normalizePathList(ignoredPaths);
-  if (includes.length === 0 && ignores.length === 0) {
+  if (ignores.length === 0) {
     return [];
   }
 
   return [
     "--",
-    ...(includes.length > 0 ? includes : ["."]).map(quoteCommandArg),
+    quoteCommandArg("."),
     ...ignores.map(ignoredPath => quoteCommandArg(`:(exclude)${ignoredPath}`))
   ];
 }
@@ -193,12 +221,11 @@ function buildPathspecCommandParts(includedPaths = [], ignoredPaths = []) {
  * 中文：给任意 Git 命令追加审查范围 pathspec，确保状态、diff、未跟踪文件使用同一范围。
  *
  * @param {string[]} args Git arguments before pathspecs.
- * @param {string[]} includedPaths Repository-relative paths to include.
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
  * @returns {string[]} Scoped Git arguments.
  */
-function buildScopedGitArgs(args, includedPaths = [], ignoredPaths = []) {
-  return [...args, ...buildPathspecArgs(includedPaths, ignoredPaths)];
+function buildScopedGitArgs(args, ignoredPaths = []) {
+  return [...args, ...buildPathspecArgs(ignoredPaths)];
 }
 
 /**
@@ -206,12 +233,11 @@ function buildScopedGitArgs(args, includedPaths = [], ignoredPaths = []) {
  * 中文：生成带审查范围的可读 Git 命令，方便报告追溯证据来源。
  *
  * @param {string[]} args Git arguments before pathspecs.
- * @param {string[]} includedPaths Repository-relative paths to include.
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
  * @returns {string} Display command.
  */
-function buildScopedGitCommand(args, includedPaths = [], ignoredPaths = []) {
-  return ["git", ...args, ...buildPathspecCommandParts(includedPaths, ignoredPaths)].join(" ");
+function buildScopedGitCommand(args, ignoredPaths = []) {
+  return ["git", ...args, ...buildPathspecCommandParts(ignoredPaths)].join(" ");
 }
 
 /**
@@ -322,24 +348,23 @@ function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignore
 }
 
 /**
- * Build git diff arguments with optional path includes and exclusions.
- * 中文：构造 git diff 参数，并按统一范围包含业务路径、排除 Skill 自身等辅助路径。
+ * Build git diff arguments with optional path exclusions.
+ * 中文：构造 git diff 参数，并在统一审查范围内排除 Skill 自身等辅助路径。
  * Pathspecs are applied after `--` so every diff-derived evidence section reads
  * the same review scope.
  *
  * @param {string|null} base Diff base ref, or null for working-tree diff only.
  * @param {string[]} options Git diff options such as `--stat` or `--check`.
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
- * @param {string[]} includedPaths Repository-relative paths to include.
  * @returns {string[]} Arguments passed to `git`.
  */
-function buildDiffArgs(base, options = [], ignoredPaths = [], includedPaths = []) {
+function buildDiffArgs(base, options = [], ignoredPaths = []) {
   const args = ["diff"];
   if (base) {
     args.push(base);
   }
   args.push(...options);
-  return buildScopedGitArgs(args, includedPaths, ignoredPaths);
+  return buildScopedGitArgs(args, ignoredPaths);
 }
 
 /**
@@ -351,16 +376,15 @@ function buildDiffArgs(base, options = [], ignoredPaths = [], includedPaths = []
  * @param {string|null} base Diff base ref, or null for working-tree diff only.
  * @param {string[]} options Git diff options.
  * @param {string[]} ignoredPaths Repository-relative excluded paths.
- * @param {string[]} includedPaths Repository-relative included paths.
  * @returns {string} Display command.
  */
-function buildDiffCommand(base, options = [], ignoredPaths = [], includedPaths = []) {
+function buildDiffCommand(base, options = [], ignoredPaths = []) {
   const parts = ["git", "diff"];
   if (base) {
     parts.push(base);
   }
   parts.push(...options);
-  return [...parts, ...buildPathspecCommandParts(includedPaths, ignoredPaths)].join(" ");
+  return [...parts, ...buildPathspecCommandParts(ignoredPaths)].join(" ");
 }
 
 /**
@@ -540,18 +564,15 @@ function splitChangedFiles(changes, repoRoot) {
 }
 
 /**
- * Render include/exclude paths for the document header.
- * 中文：把审查包含/排除范围渲染到报告头部，避免使用者误解当前脚本审查了哪些路径。
+ * Render excluded paths for the document header.
+ * 中文：把审查排除范围渲染到报告头部，避免使用者误解当前脚本忽略了哪些路径。
  *
- * @param {string[]} includedPaths Repository-relative included paths.
  * @param {string[]} ignoredPaths Repository-relative excluded paths.
- * @returns {string} Two-line scope summary.
+ * @returns {string} One-line scope summary.
  */
-function buildReviewScopeSummary(includedPaths, ignoredPaths) {
-  const includes = normalizePathList(includedPaths);
+function buildReviewScopeSummary(ignoredPaths) {
   const ignores = normalizePathList(ignoredPaths);
-  return `Included paths: ${includes.length > 0 ? includes.join(", ") : "(all repository paths)"}
-Excluded paths: ${ignores.length > 0 ? ignores.join(", ") : "(none)"}`;
+  return `Review scope: all repository changes${ignores.length > 0 ? ` except ${ignores.join(", ")}` : ""}`;
 }
 
 /**
@@ -1375,20 +1396,19 @@ function main() {
   const repoRoot = resolveRepoRoot(options.repo);
   const base = hasHead(repoRoot) ? options.base : null;
   const generatedAt = new Date().toISOString();
-  const includedPathList = normalizePathList(options.includePaths);
   const staticIgnoredPathList = normalizePathList([getOwnSkillIgnoredPath(repoRoot)].filter(Boolean));
 
   const branch = runGit(["branch", "--show-current"], repoRoot);
-  const status = runGit(buildScopedGitArgs(["status", "--short", "--branch"], includedPathList, staticIgnoredPathList), repoRoot);
-  const untracked = runGit(buildScopedGitArgs(["ls-files", "--others", "--exclude-standard"], includedPathList, staticIgnoredPathList), repoRoot);
-  const nameStatus = runGit(buildDiffArgs(base, ["--name-status"], staticIgnoredPathList, includedPathList), repoRoot);
+  const status = runGit(buildScopedGitArgs(["status", "--short", "--branch"], staticIgnoredPathList), repoRoot);
+  const untracked = runGit(buildScopedGitArgs(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList), repoRoot);
+  const nameStatus = runGit(buildDiffArgs(base, ["--name-status"], staticIgnoredPathList), repoRoot);
   const parsedChangedFiles = parseNameStatusLines(nameStatus.stdout);
   const { changes: changedFiles, ignoredChanges } = splitChangedFiles(parsedChangedFiles, repoRoot);
   const ignoredPathList = normalizePathList([...staticIgnoredPathList, ...ignoredChanges.map(change => change.filePath)]);
   const ignoredPaths = new Set(ignoredPathList);
-  const diffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList, includedPathList), repoRoot);
-  const diffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList, includedPathList), repoRoot);
-  const fullDiff = runGit(buildDiffArgs(base, [], ignoredPathList, includedPathList), repoRoot);
+  const diffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList), repoRoot);
+  const diffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList), repoRoot);
+  const fullDiff = runGit(buildDiffArgs(base, [], ignoredPathList), repoRoot);
 
   const testCmd = options.noTests ? null : options.testCmd || detectDefaultTestCommand(repoRoot);
   const testResult = testCmd ? run(testCmd, [], repoRoot, true) : null;
@@ -1402,23 +1422,23 @@ Generated: ${generatedAt}
 Repository: ${repoRoot}
 Branch: ${branch.stdout.trim() || "(detached or unknown)"}
 Diff base: ${base || "(no HEAD; working tree diff only)"}
-${buildReviewScopeSummary(includedPathList, ignoredPathList)}
+${buildReviewScopeSummary(ignoredPathList)}
 `);
 
   parts.push(section("Report Contract", buildReportContract(testCmd)));
   parts.push(section("Review Decision Floor", buildReviewDecisionFloor(priorityFindings)));
   parts.push(section("Priority Findings", buildPriorityFindings(priorityFindings)));
-  parts.push(section("Repository State", commandBlock(buildScopedGitCommand(["status", "--short", "--branch"], includedPathList, staticIgnoredPathList), status)));
-  parts.push(section("Changed Files", buildChangedFilesSection(buildDiffCommand(base, ["--name-status"], staticIgnoredPathList, includedPathList), nameStatus, changedFiles, ignoredChanges)));
-  parts.push(section("Untracked Files", commandBlock(buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], includedPathList, staticIgnoredPathList), untracked)));
-  parts.push(section("Diff Stat", commandBlock(buildDiffCommand(base, ["--stat"], ignoredPathList, includedPathList), diffStat)));
-  parts.push(section("Diff Check", commandBlock(buildDiffCommand(base, ["--check"], ignoredPathList, includedPathList), diffCheck)));
+  parts.push(section("Repository State", commandBlock(buildScopedGitCommand(["status", "--short", "--branch"], staticIgnoredPathList), status)));
+  parts.push(section("Changed Files", buildChangedFilesSection(buildDiffCommand(base, ["--name-status"], staticIgnoredPathList), nameStatus, changedFiles, ignoredChanges)));
+  parts.push(section("Untracked Files", commandBlock(buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], staticIgnoredPathList), untracked)));
+  parts.push(section("Diff Stat", commandBlock(buildDiffCommand(base, ["--stat"], ignoredPathList), diffStat)));
+  parts.push(section("Diff Check", commandBlock(buildDiffCommand(base, ["--check"], ignoredPathList), diffCheck)));
   parts.push(section("Syntax Check", buildSyntaxCheck(repoRoot, changedFiles)));
   parts.push(section("Sensitive Literal Findings", buildSensitiveLiteralFindings(fullDiff.stdout || "", ignoredPaths)));
   parts.push(section("Changed Line Anchors", buildChangedLineAnchors(fullDiff.stdout || "", options.maxAnchors, ignoredPaths)));
 
   const diffOutput = truncate(redactText(fullDiff.stdout || fullDiff.stderr || "(no diff)"), options.maxDiffChars);
-  parts.push(section("Full Diff", `Command: ${buildDiffCommand(base, [], ignoredPathList, includedPathList)}
+  parts.push(section("Full Diff", `Command: ${buildDiffCommand(base, [], ignoredPathList)}
 Exit code: ${fullDiff.status}
 
 \`\`\`diff
