@@ -38,6 +38,7 @@ node scripts/collect-review-context.js --demo-project
 
 - 使用中文输出。
 - 严格使用 `references/output-template.md` 的分节顺序，不要省略任何必填章节。
+- 必须优先读取脚本输出中的 `Review Decision Floor` 和 `Priority Findings`；最终报告不得低于其中给出的风险等级、合并建议和风险计数下限。
 - 如果最终报告缺少“审查上下文”“风险计数”“Top 3 必须修复项”“关键风险”“测试建议”“合并前检查清单”“复审标准”中的任一章节，必须在输出前自行重写。
 - 结论区必须一项一行，禁止把“合并建议、总体风险、一句话摘要”挤在同一行。
 - 避免宽表格。关键风险使用卡片式条目，方便窄窗口阅读。
@@ -63,5 +64,6 @@ node scripts/collect-review-context.js --demo-project
 3. 是否包含 Top 3 必须修复项，且每项都有 `path:line`。
 4. 关键风险是否使用卡片式条目，并包含风险、证据、影响、建议、推荐测试。
 5. `Sensitive Literal Findings` 是否全部进入关键风险和风险计数。
-6. 是否明确 skipped 测试数量，且没有误写成覆盖率。
-7. 是否包含合并前检查清单和复审标准。
+6. 是否遵守 `Review Decision Floor` 的最低结论和计数下限。
+7. 是否明确 skipped 测试数量，且没有误写成覆盖率。
+8. 是否包含合并前检查清单和复审标准。

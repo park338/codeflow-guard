@@ -27,7 +27,8 @@ function parseArgs(argv) {
     maxDiffChars: 120000,
     maxFileChars: 20000,
     maxFiles: 20,
-    maxAnchors: 200
+    maxAnchors: 200,
+    includePaths: []
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -37,6 +38,7 @@ function parseArgs(argv) {
     } else if (arg === "--demo-project") {
       options.demoProject = true;
       options.repo = path.resolve(__dirname, "..");
+      options.includePaths = ["examples/demo-project"];
     } else if (arg === "--base") {
       options.base = argv[++i];
     } else if (arg === "--test-cmd") {
@@ -87,6 +89,129 @@ Options:
   --max-files <n>           Max changed text files to snapshot. Defaults to 20.
   --max-anchors <n>         Max changed line anchors to emit. Defaults to 200.
 `);
+}
+
+/**
+ * Normalize repository-relative paths for Git pathspecs and set comparisons.
+ * 中文：把仓库相对路径规范化为 Git pathspec 友好的正斜杠格式。
+ * Git accepts forward slashes on every platform; normalizing once prevents
+ * Windows backslashes from breaking include/exclude scope rules.
+ *
+ * @param {string} filePath Repository-relative path or pathspec.
+ * @returns {string} Normalized repository path.
+ */
+function normalizeRepoPath(filePath) {
+  return String(filePath || "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "");
+}
+
+/**
+ * Normalize and deduplicate a list of repository pathspecs.
+ * 中文：规范化并去重仓库 pathspec 列表，避免重复范围让输出变得嘈杂。
+ *
+ * @param {string[]} paths Raw pathspec list.
+ * @returns {string[]} Stable unique pathspec list.
+ */
+function normalizePathList(paths) {
+  const seen = new Set();
+  const normalized = [];
+
+  for (const entry of paths || []) {
+    const value = normalizeRepoPath(entry);
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    normalized.push(value);
+  }
+
+  return normalized;
+}
+
+/**
+ * Build scoped Git pathspec arguments from include and exclude paths.
+ * 中文：根据包含路径和排除路径构造 Git pathspec 参数。
+ * With no explicit include path, `.` keeps generic mode broad enough to scan all
+ * business changes while still allowing Skill support paths to be excluded.
+ *
+ * @param {string[]} includedPaths Repository-relative paths to include.
+ * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @returns {string[]} Git arguments beginning with `--`, or an empty list.
+ */
+function buildPathspecArgs(includedPaths = [], ignoredPaths = []) {
+  const includes = normalizePathList(includedPaths);
+  const ignores = normalizePathList(ignoredPaths);
+  if (includes.length === 0 && ignores.length === 0) {
+    return [];
+  }
+
+  return [
+    "--",
+    ...(includes.length > 0 ? includes : ["."]),
+    ...ignores.map(ignoredPath => `:(exclude)${ignoredPath}`)
+  ];
+}
+
+/**
+ * Quote a command argument for display in the generated evidence document.
+ * 中文：为报告中的可读命令参数加引号，避免空格或 pathspec 魔法字符造成歧义。
+ * Actual execution still uses structured argument arrays; this is display-only.
+ *
+ * @param {string} value Command argument.
+ * @returns {string} Quoted argument for human-readable command text.
+ */
+function quoteCommandArg(value) {
+  return `"${String(value).replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Render display-only pathspec command parts matching `buildPathspecArgs`.
+ * 中文：生成和实际 pathspec 参数一致的可读命令片段。
+ *
+ * @param {string[]} includedPaths Repository-relative included paths.
+ * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @returns {string[]} Display command parts.
+ */
+function buildPathspecCommandParts(includedPaths = [], ignoredPaths = []) {
+  const includes = normalizePathList(includedPaths);
+  const ignores = normalizePathList(ignoredPaths);
+  if (includes.length === 0 && ignores.length === 0) {
+    return [];
+  }
+
+  return [
+    "--",
+    ...(includes.length > 0 ? includes : ["."]).map(quoteCommandArg),
+    ...ignores.map(ignoredPath => quoteCommandArg(`:(exclude)${ignoredPath}`))
+  ];
+}
+
+/**
+ * Append review scope pathspecs to an arbitrary Git command.
+ * 中文：给任意 Git 命令追加审查范围 pathspec，确保状态、diff、未跟踪文件使用同一范围。
+ *
+ * @param {string[]} args Git arguments before pathspecs.
+ * @param {string[]} includedPaths Repository-relative paths to include.
+ * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @returns {string[]} Scoped Git arguments.
+ */
+function buildScopedGitArgs(args, includedPaths = [], ignoredPaths = []) {
+  return [...args, ...buildPathspecArgs(includedPaths, ignoredPaths)];
+}
+
+/**
+ * Render a display command for a scoped Git command.
+ * 中文：生成带审查范围的可读 Git 命令，方便报告追溯证据来源。
+ *
+ * @param {string[]} args Git arguments before pathspecs.
+ * @param {string[]} includedPaths Repository-relative paths to include.
+ * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @returns {string} Display command.
+ */
+function buildScopedGitCommand(args, includedPaths = [], ignoredPaths = []) {
+  return ["git", ...args, ...buildPathspecCommandParts(includedPaths, ignoredPaths)].join(" ");
 }
 
 /**
@@ -197,29 +322,24 @@ function buildChangedFilesSection(diffCommand, nameStatusResult, changes, ignore
 }
 
 /**
- * Build git diff arguments with optional path exclusions.
- * 中文：构造 git diff 参数，并在需要时排除 Skill 自身等辅助路径。
- * Pathspec exclusions are applied after `--` so normal product-code paths still
- * flow into every diff-derived evidence section.
+ * Build git diff arguments with optional path includes and exclusions.
+ * 中文：构造 git diff 参数，并按统一范围包含业务路径、排除 Skill 自身等辅助路径。
+ * Pathspecs are applied after `--` so every diff-derived evidence section reads
+ * the same review scope.
  *
  * @param {string|null} base Diff base ref, or null for working-tree diff only.
  * @param {string[]} options Git diff options such as `--stat` or `--check`.
  * @param {string[]} ignoredPaths Repository-relative paths to exclude.
+ * @param {string[]} includedPaths Repository-relative paths to include.
  * @returns {string[]} Arguments passed to `git`.
  */
-function buildDiffArgs(base, options = [], ignoredPaths = []) {
+function buildDiffArgs(base, options = [], ignoredPaths = [], includedPaths = []) {
   const args = ["diff"];
   if (base) {
     args.push(base);
   }
   args.push(...options);
-  if (ignoredPaths.length > 0) {
-    args.push("--", ".");
-    for (const ignoredPath of ignoredPaths) {
-      args.push(`:(exclude)${ignoredPath}`);
-    }
-  }
-  return args;
+  return buildScopedGitArgs(args, includedPaths, ignoredPaths);
 }
 
 /**
@@ -231,21 +351,16 @@ function buildDiffArgs(base, options = [], ignoredPaths = []) {
  * @param {string|null} base Diff base ref, or null for working-tree diff only.
  * @param {string[]} options Git diff options.
  * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @param {string[]} includedPaths Repository-relative included paths.
  * @returns {string} Display command.
  */
-function buildDiffCommand(base, options = [], ignoredPaths = []) {
+function buildDiffCommand(base, options = [], ignoredPaths = [], includedPaths = []) {
   const parts = ["git", "diff"];
   if (base) {
     parts.push(base);
   }
   parts.push(...options);
-  if (ignoredPaths.length > 0) {
-    parts.push("--", ".");
-    for (const ignoredPath of ignoredPaths) {
-      parts.push(`":(exclude)${ignoredPath}"`);
-    }
-  }
-  return parts.join(" ");
+  return [...parts, ...buildPathspecCommandParts(includedPaths, ignoredPaths)].join(" ");
 }
 
 /**
@@ -371,6 +486,30 @@ function isOwnSkillPath(repoRoot, filePath) {
 }
 
 /**
+ * Resolve this Skill package as an excluded path when reviewing an outer repo.
+ * 中文：审查外层业务仓库时，计算当前 Skill 自身应被排除的仓库相对路径。
+ * This static exclusion also hides untracked Skill files from status sections,
+ * not only files that already appear in `git diff --name-status`.
+ *
+ * @param {string} repoRoot Repository root being inspected.
+ * @returns {string|null} Repository-relative Skill path to exclude, if any.
+ */
+function getOwnSkillIgnoredPath(repoRoot) {
+  const skillRoot = path.resolve(__dirname, "..");
+  const reviewedRoot = path.resolve(repoRoot);
+  if (reviewedRoot === skillRoot) {
+    return null;
+  }
+
+  const relative = path.relative(reviewedRoot, skillRoot);
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    return null;
+  }
+
+  return normalizeRepoPath(relative);
+}
+
+/**
  * Split parsed changes into reviewable files and ignored gitlink entries.
  * 中文：把变更拆分为可审查文件和需要忽略的 gitlink 条目。
  * Deleted files remain reviewable for diff evidence, but later snapshot and
@@ -401,6 +540,21 @@ function splitChangedFiles(changes, repoRoot) {
 }
 
 /**
+ * Render include/exclude paths for the document header.
+ * 中文：把审查包含/排除范围渲染到报告头部，避免使用者误解当前脚本审查了哪些路径。
+ *
+ * @param {string[]} includedPaths Repository-relative included paths.
+ * @param {string[]} ignoredPaths Repository-relative excluded paths.
+ * @returns {string} Two-line scope summary.
+ */
+function buildReviewScopeSummary(includedPaths, ignoredPaths) {
+  const includes = normalizePathList(includedPaths);
+  const ignores = normalizePathList(ignoredPaths);
+  return `Included paths: ${includes.length > 0 ? includes.join(", ") : "(all repository paths)"}
+Excluded paths: ${ignores.length > 0 ? ignores.join(", ") : "(none)"}`;
+}
+
+/**
  * Build the final-report contract injected into the collected context.
  * 中文：生成最终报告契约，直接放入采集上下文中约束模型输出。
  * This gives the reviewing model a compact checklist of hard output rules close
@@ -410,7 +564,7 @@ function splitChangedFiles(changes, repoRoot) {
  * @returns {string} Human-readable report contract.
  */
 function buildReportContract(testCmd) {
-  return `Final review output must include these top-level sections in order:
+  return `最终审查报告必须按以下顶层章节顺序输出：
 
 1. 结论
 2. 审查上下文
@@ -421,16 +575,18 @@ function buildReportContract(testCmd) {
 7. 合并前检查清单
 8. 复审标准
 
-Hard requirements:
-- Do not merge conclusion fields into one line.
-- Include risk counts: P0/P1/P2/P3.
-- Include the test command: ${testCmd || "(not provided)"}.
-- Include Diff Check result.
-- Top 3 and every key risk title must include path:line. Use Changed Line Anchors first, then Current File Snapshots.
-- Every item in Sensitive Literal Findings must appear in key risks and risk counts. Treat hardcoded key/token/secret/password/connection string as P0 unless clearly harmless test fixture.
-- Top 3 must prioritize auth bypass, hardcoded secrets/tokens, data or money risk, and skipped critical tests.
-- Do not call pass/skipped ratio coverage unless a coverage tool produced coverage data.
-- If skipped tests are present, list them as test risks.`;
+硬约束：
+- 必须先阅读并遵守 Review Decision Floor；最终结论不得低于其中的最低风险等级、最低合并建议和风险计数下限。
+- Priority Findings 中每一项都必须进入关键风险或 Top 3 候选；P0/P1 项必须计入风险计数。
+- 结论区必须一项一行，不能把合并建议、总体风险、摘要挤在同一行。
+- 必须包含风险计数：P0/P1/P2/P3。
+- 必须包含测试命令：${testCmd || "(not provided)"}。
+- 必须包含 Diff Check 结果。
+- Top 3 和每个关键风险标题必须包含 path:line。优先使用 Changed Line Anchors，再使用 Current File Snapshots。
+- Sensitive Literal Findings 中每一项都必须进入关键风险和风险计数；hardcoded key/token/secret/password/connection string 默认 P0，除非上下文证明只是无害测试 fixture。
+- Top 3 必须优先考虑认证绕过、硬编码密钥/令牌、数据/资金风险、关键测试被跳过。
+- 没有 coverage 工具输出时，不要把通过/跳过比例写成覆盖率。
+- 发现 skipped 测试时，必须列为测试风险。`;
 }
 
 /**
@@ -604,6 +760,266 @@ function extractSensitiveValue(content) {
     return maskSensitiveValue(direct[1]);
   }
   return "(value not extracted)";
+}
+
+/**
+ * Walk a unified diff and expose added/deleted lines with file and line metadata.
+ * 中文：遍历 unified diff，把新增/删除行转换为包含文件和行号的结构化记录。
+ * Several higher-level detectors share this parser so line-number behavior stays
+ * consistent across priority findings, anchors, and sensitive literal checks.
+ *
+ * @param {string} diffText Raw unified diff.
+ * @param {Set<string>} [ignoredPaths=new Set()] Paths excluded from detection.
+ * @returns {{filePath:string,lineNumber:number,oldLineNumber:number,kind:string,content:string}[]} Changed line records.
+ */
+function parseDiffLineRecords(diffText, ignoredPaths = new Set()) {
+  const records = [];
+  const lines = diffText.split(/\r?\n/);
+  let filePath = null;
+  let oldFilePath = null;
+  let oldLine = 0;
+  let newLine = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("--- a/")) {
+      oldFilePath = line.slice("--- a/".length);
+      continue;
+    }
+    if (line.startsWith("+++ b/")) {
+      filePath = line.slice("+++ b/".length);
+      continue;
+    }
+    if (line.startsWith("+++ /dev/null")) {
+      filePath = oldFilePath;
+      continue;
+    }
+
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      continue;
+    }
+
+    if (!filePath || ignoredPaths.has(filePath) || oldLine <= 0 || newLine <= 0) {
+      continue;
+    }
+
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      records.push({
+        filePath,
+        lineNumber: newLine,
+        oldLineNumber: oldLine,
+        kind: "added",
+        content: line.slice(1)
+      });
+      newLine += 1;
+      continue;
+    }
+
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      records.push({
+        filePath,
+        lineNumber: oldLine,
+        oldLineNumber: oldLine,
+        kind: "deleted",
+        content: line.slice(1)
+      });
+      oldLine += 1;
+      continue;
+    }
+
+    if (line.startsWith(" ")) {
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+
+  return records;
+}
+
+/**
+ * Convert a priority finding object into a compact Markdown evidence card.
+ * 中文：把结构化优先级风险转换为便于 LLM 读取的紧凑证据卡片。
+ * The output is intentionally repetitive and explicit so mandatory report
+ * actions are hard to miss during final report generation.
+ *
+ * @param {{severity:string,type:string,location:string,evidence:string,requiredAction:string}} finding Priority finding.
+ * @param {number} index One-based finding index.
+ * @returns {string} Markdown finding card.
+ */
+function formatPriorityFinding(finding, index) {
+  return `### F${index} ${finding.severity} ${finding.type}
+
+- Location: ${finding.location}
+- Evidence: ${finding.evidence}
+- Required report action: ${finding.requiredAction}`;
+}
+
+/**
+ * Detect high-priority findings that should drive the final report.
+ * 中文：从结构化 diff 和测试摘要中提取必须优先进入报告的风险。
+ * This section is placed before the long diff so the model sees hard findings,
+ * required severity, and required report actions before lower-priority context.
+ *
+ * @param {string} diffText Raw unified diff.
+ * @param {Set<string>} ignoredPaths Paths excluded from detection.
+ * @param {object|null} parsedTestSummary Parsed test counts.
+ * @returns {{severity:string,type:string,location:string,evidence:string,requiredAction:string}[]} Priority findings.
+ */
+function detectPriorityFindings(diffText, ignoredPaths, parsedTestSummary) {
+  const records = parseDiffLineRecords(diffText, ignoredPaths);
+  const findings = [];
+  const seen = new Set();
+
+  const addFinding = finding => {
+    const key = finding.dedupeKey || `${finding.type}:${finding.location}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    findings.push(finding);
+  };
+
+  for (const record of records) {
+    const isTestFile = /(^|\/)(test|tests|__tests__)\//i.test(record.filePath) || /\.test\.[cm]?jsx?$/i.test(record.filePath) || /\.spec\.[cm]?jsx?$/i.test(record.filePath);
+    const isSourceFile = !isTestFile;
+
+    if (record.kind !== "added") {
+      continue;
+    }
+
+    const sensitive = classifySensitiveLine(record.content);
+    if (sensitive && isSourceFile) {
+      addFinding({
+        severity: "P0",
+        type: "hardcoded_sensitive_literal",
+        dedupeKey: `hardcoded_sensitive_literal:${record.filePath}:${record.lineNumber}`,
+        location: `${record.filePath}:${record.lineNumber}`,
+        evidence: `${sensitive.label} | ${extractSensitiveValue(record.content)} | ${redactSensitiveContent(record.content.trim())}`,
+        requiredAction: "必须进入关键风险、风险计数和 Top 3 候选；合并建议不得高于“不建议合并”。"
+      });
+    }
+
+    if (isSourceFile && /\breturn\s+\{\s*ok:\s*true\b/.test(record.content) && /auth|login|token|permission|access/i.test(record.filePath)) {
+      addFinding({
+        severity: "P0",
+        type: "auth_bypass",
+        dedupeKey: `auth_bypass:${record.filePath}`,
+        location: `${record.filePath}:${record.lineNumber}`,
+        evidence: redactSensitiveContent(record.content.trim()),
+        requiredAction: "必须进入关键风险和风险计数；总体风险至少 P0；合并建议必须为“不建议合并”。"
+      });
+    }
+
+    if (isSourceFile && /console\.log\(/.test(record.content) && /auth|token|password|secret|authorization/i.test(record.content)) {
+      addFinding({
+        severity: "P1",
+        type: "sensitive_auth_logging",
+        dedupeKey: `sensitive_auth_logging:${record.filePath}`,
+        location: `${record.filePath}:${record.lineNumber}`,
+        evidence: redactSensitiveContent(record.content.trim()),
+        requiredAction: "必须进入关键风险或测试建议；说明日志泄露风险。"
+      });
+    }
+
+    if (/test\.skip|describe\.skip|it\.skip/.test(record.content)) {
+      addFinding({
+        severity: "P1",
+        type: "skipped_critical_test",
+        dedupeKey: `skipped_critical_test:${record.filePath}:${record.lineNumber}`,
+        location: `${record.filePath}:${record.lineNumber}`,
+        evidence: redactSensitiveContent(record.content.trim()),
+        requiredAction: "必须进入关键风险和风险计数；测试结果必须写明跳过数量。"
+      });
+    }
+  }
+
+  for (const record of records) {
+    const isTestFile = /(^|\/)(test|tests|__tests__)\//i.test(record.filePath) || /\.test\.[cm]?jsx?$/i.test(record.filePath) || /\.spec\.[cm]?jsx?$/i.test(record.filePath);
+    const isSourceFile = !isTestFile;
+
+    if (record.kind !== "deleted") {
+      continue;
+    }
+
+    if (isSourceFile && /invalid token|missing token|unauthorized|jwtSecret|authorization/i.test(record.content)) {
+      addFinding({
+        severity: "P0",
+        type: "auth_rejection_removed",
+        dedupeKey: `auth_rejection_removed:${record.filePath}`,
+        location: `${record.filePath}:${record.lineNumber} (deleted)`,
+        evidence: redactSensitiveContent(record.content.trim()),
+        requiredAction: "必须进入关键风险和风险计数；总体风险至少 P0。"
+      });
+    }
+
+    if (isSourceFile && /invalid quantity|invalid price|Math\.min|Math\.max|coupon|quantity|unitPrice/i.test(record.content)) {
+      addFinding({
+        severity: "P1",
+        type: "business_validation_removed",
+        dedupeKey: `business_validation_removed:${record.filePath}`,
+        location: `${record.filePath}:${record.lineNumber} (deleted)`,
+        evidence: redactSensitiveContent(record.content.trim()),
+        requiredAction: "必须进入关键风险或 Top 3 候选；说明订单金额或数据完整性风险。"
+      });
+    }
+  }
+
+  if (parsedTestSummary && typeof parsedTestSummary.skipped === "number" && parsedTestSummary.skipped > 0) {
+    addFinding({
+      severity: "P1",
+      type: "test_run_has_skips",
+      dedupeKey: "test_run_has_skips",
+      location: "Parsed Test Summary",
+      evidence: `Skipped tests = ${parsedTestSummary.skipped}`,
+      requiredAction: "必须写入测试结果、关键风险或测试建议；不得描述为覆盖率。"
+    });
+  }
+
+  return findings;
+}
+
+/**
+ * Render priority findings or an explicit no-findings message.
+ * 中文：渲染优先级风险列表；没有发现时也给出明确说明。
+ * Keeping this section short and near the top makes it the primary input for
+ * final report generation.
+ *
+ * @param {{severity:string,type:string,location:string,evidence:string,requiredAction:string}[]} findings Priority findings.
+ * @returns {string} Markdown section body.
+ */
+function buildPriorityFindings(findings) {
+  if (findings.length === 0) {
+    return "No priority findings were detected by rule-based pre-scan. Review the diff and tests normally.";
+  }
+
+  return findings.map((finding, index) => formatPriorityFinding(finding, index + 1)).join("\n\n");
+}
+
+/**
+ * Build minimum final-report requirements from priority findings.
+ * 中文：根据优先级风险生成最低风险等级、最低合并建议和风险计数下限。
+ * The final LLM report may be stricter, but it should not go below these floors.
+ *
+ * @param {{severity:string}[]} findings Priority findings.
+ * @returns {string} Markdown requirement summary.
+ */
+function buildReviewDecisionFloor(findings) {
+  const counts = { P0: 0, P1: 0, P2: 0, P3: 0 };
+  for (const finding of findings) {
+    if (Object.prototype.hasOwnProperty.call(counts, finding.severity)) {
+      counts[finding.severity] += 1;
+    }
+  }
+
+  const minimumRisk = counts.P0 > 0 ? "P0" : counts.P1 > 0 ? "P1" : counts.P2 > 0 ? "P2" : counts.P3 > 0 ? "P3" : "P3";
+  const minimumAdvice = counts.P0 > 0 ? "不建议合并" : counts.P1 > 0 ? "补测后合并" : "可合并";
+
+  return `Minimum Overall Risk: ${minimumRisk}
+Minimum Merge Advice: ${minimumAdvice}
+Required Risk Count Floor: P0 >= ${counts.P0}, P1 >= ${counts.P1}, P2 >= ${counts.P2}, P3 >= ${counts.P3}
+Rule: final report may be stricter than this floor, but must not be less strict.`;
 }
 
 /**
@@ -830,6 +1246,21 @@ function parseNodeTestSummary(output) {
 }
 
 /**
+ * Parse a command result into structured test counts when supported.
+ * 中文：从测试命令结果中提取结构化统计，供风险预扫描和摘要输出复用。
+ *
+ * @param {{stdout:string, stderr:string}|null} testResult Raw test command result.
+ * @returns {object|null} Parsed summary counts, or null if unavailable.
+ */
+function parseTestSummary(testResult) {
+  if (!testResult) {
+    return null;
+  }
+
+  return parseNodeTestSummary(`${testResult.stdout}\n${testResult.stderr}`);
+}
+
+/**
  * Build a compact parsed test summary for the review context.
  * 中文：生成简洁的测试统计摘要，并明确 skipped 不能当作覆盖率。
  * When skipped tests are present, the warning explicitly prevents treating
@@ -838,27 +1269,25 @@ function parseNodeTestSummary(output) {
  * @param {{stdout:string, stderr:string}|null} testResult Raw test command result.
  * @returns {string} Parsed test summary or fallback guidance.
  */
-function buildParsedTestSummary(testResult) {
+function buildParsedTestSummary(testResult, parsedSummary = parseTestSummary(testResult)) {
   if (!testResult) {
     return "No test command was provided or detected.";
   }
 
-  const combined = `${testResult.stdout}\n${testResult.stderr}`;
-  const nodeSummary = parseNodeTestSummary(combined);
-  if (!nodeSummary) {
+  if (!parsedSummary) {
     return "No structured test summary was parsed. Use the raw Test Result section as evidence.";
   }
 
-  const skipped = typeof nodeSummary.skipped === "number" ? nodeSummary.skipped : "unknown";
-  const warning = typeof nodeSummary.skipped === "number" && nodeSummary.skipped > 0
+  const skipped = typeof parsedSummary.skipped === "number" ? parsedSummary.skipped : "unknown";
+  const warning = typeof parsedSummary.skipped === "number" && parsedSummary.skipped > 0
     ? "\n\nWarning: skipped tests are not coverage. Treat skipped key tests as review risk."
     : "";
 
-  return `Tests: ${nodeSummary.tests ?? "unknown"}
-Passed: ${nodeSummary.pass ?? "unknown"}
-Failed: ${nodeSummary.fail ?? "unknown"}
+  return `Tests: ${parsedSummary.tests ?? "unknown"}
+Passed: ${parsedSummary.pass ?? "unknown"}
+Failed: ${parsedSummary.fail ?? "unknown"}
 Skipped: ${skipped}
-Todo: ${nodeSummary.todo ?? "unknown"}${warning}`;
+Todo: ${parsedSummary.todo ?? "unknown"}${warning}`;
 }
 
 /**
@@ -946,21 +1375,25 @@ function main() {
   const repoRoot = resolveRepoRoot(options.repo);
   const base = hasHead(repoRoot) ? options.base : null;
   const generatedAt = new Date().toISOString();
+  const includedPathList = normalizePathList(options.includePaths);
+  const staticIgnoredPathList = normalizePathList([getOwnSkillIgnoredPath(repoRoot)].filter(Boolean));
 
   const branch = runGit(["branch", "--show-current"], repoRoot);
-  const status = runGit(["status", "--short", "--branch"], repoRoot);
-  const untracked = runGit(["ls-files", "--others", "--exclude-standard"], repoRoot);
-  const nameStatus = runGit(buildDiffArgs(base, ["--name-status"]), repoRoot);
+  const status = runGit(buildScopedGitArgs(["status", "--short", "--branch"], includedPathList, staticIgnoredPathList), repoRoot);
+  const untracked = runGit(buildScopedGitArgs(["ls-files", "--others", "--exclude-standard"], includedPathList, staticIgnoredPathList), repoRoot);
+  const nameStatus = runGit(buildDiffArgs(base, ["--name-status"], staticIgnoredPathList, includedPathList), repoRoot);
   const parsedChangedFiles = parseNameStatusLines(nameStatus.stdout);
   const { changes: changedFiles, ignoredChanges } = splitChangedFiles(parsedChangedFiles, repoRoot);
-  const ignoredPathList = ignoredChanges.map(change => change.filePath);
+  const ignoredPathList = normalizePathList([...staticIgnoredPathList, ...ignoredChanges.map(change => change.filePath)]);
   const ignoredPaths = new Set(ignoredPathList);
-  const diffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList), repoRoot);
-  const diffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList), repoRoot);
-  const fullDiff = runGit(buildDiffArgs(base, [], ignoredPathList), repoRoot);
+  const diffStat = runGit(buildDiffArgs(base, ["--stat"], ignoredPathList, includedPathList), repoRoot);
+  const diffCheck = runGit(buildDiffArgs(base, ["--check"], ignoredPathList, includedPathList), repoRoot);
+  const fullDiff = runGit(buildDiffArgs(base, [], ignoredPathList, includedPathList), repoRoot);
 
   const testCmd = options.noTests ? null : options.testCmd || detectDefaultTestCommand(repoRoot);
   const testResult = testCmd ? run(testCmd, [], repoRoot, true) : null;
+  const parsedTestSummary = parseTestSummary(testResult);
+  const priorityFindings = detectPriorityFindings(fullDiff.stdout || "", ignoredPaths, parsedTestSummary);
 
   const parts = [];
   parts.push(`# CodeFlow Guard Review Context
@@ -969,20 +1402,23 @@ Generated: ${generatedAt}
 Repository: ${repoRoot}
 Branch: ${branch.stdout.trim() || "(detached or unknown)"}
 Diff base: ${base || "(no HEAD; working tree diff only)"}
+${buildReviewScopeSummary(includedPathList, ignoredPathList)}
 `);
 
   parts.push(section("Report Contract", buildReportContract(testCmd)));
-  parts.push(section("Repository State", commandBlock("git status --short --branch", status)));
-  parts.push(section("Changed Files", buildChangedFilesSection(buildDiffCommand(base, ["--name-status"]), nameStatus, changedFiles, ignoredChanges)));
-  parts.push(section("Untracked Files", commandBlock("git ls-files --others --exclude-standard", untracked)));
-  parts.push(section("Diff Stat", commandBlock(buildDiffCommand(base, ["--stat"], ignoredPathList), diffStat)));
-  parts.push(section("Diff Check", commandBlock(buildDiffCommand(base, ["--check"], ignoredPathList), diffCheck)));
+  parts.push(section("Review Decision Floor", buildReviewDecisionFloor(priorityFindings)));
+  parts.push(section("Priority Findings", buildPriorityFindings(priorityFindings)));
+  parts.push(section("Repository State", commandBlock(buildScopedGitCommand(["status", "--short", "--branch"], includedPathList, staticIgnoredPathList), status)));
+  parts.push(section("Changed Files", buildChangedFilesSection(buildDiffCommand(base, ["--name-status"], staticIgnoredPathList, includedPathList), nameStatus, changedFiles, ignoredChanges)));
+  parts.push(section("Untracked Files", commandBlock(buildScopedGitCommand(["ls-files", "--others", "--exclude-standard"], includedPathList, staticIgnoredPathList), untracked)));
+  parts.push(section("Diff Stat", commandBlock(buildDiffCommand(base, ["--stat"], ignoredPathList, includedPathList), diffStat)));
+  parts.push(section("Diff Check", commandBlock(buildDiffCommand(base, ["--check"], ignoredPathList, includedPathList), diffCheck)));
   parts.push(section("Syntax Check", buildSyntaxCheck(repoRoot, changedFiles)));
   parts.push(section("Sensitive Literal Findings", buildSensitiveLiteralFindings(fullDiff.stdout || "", ignoredPaths)));
   parts.push(section("Changed Line Anchors", buildChangedLineAnchors(fullDiff.stdout || "", options.maxAnchors, ignoredPaths)));
 
   const diffOutput = truncate(redactText(fullDiff.stdout || fullDiff.stderr || "(no diff)"), options.maxDiffChars);
-  parts.push(section("Full Diff", `Command: ${buildDiffCommand(base, [], ignoredPathList)}
+  parts.push(section("Full Diff", `Command: ${buildDiffCommand(base, [], ignoredPathList, includedPathList)}
 Exit code: ${fullDiff.status}
 
 \`\`\`diff
@@ -993,7 +1429,7 @@ ${diffOutput}
 
   if (testResult) {
     parts.push(section("Test Result", commandBlock(testCmd, testResult)));
-    parts.push(section("Parsed Test Summary", buildParsedTestSummary(testResult)));
+    parts.push(section("Parsed Test Summary", buildParsedTestSummary(testResult, parsedTestSummary)));
   } else {
     parts.push(section("Test Result", "No test command was provided or detected. Use `--test-cmd \"<command>\"` to include test evidence."));
     parts.push(section("Parsed Test Summary", buildParsedTestSummary(null)));
