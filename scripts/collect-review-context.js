@@ -3,6 +3,13 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const {
+  buildSyntaxCheckPlan,
+  collectRelativeReferencePlans,
+  isSkippedTestMarker,
+  parseTestSummary: parseAdapterTestSummary,
+  shouldScanSignals
+} = require("./language-adapters");
 
 /**
  * Read the value that must follow a command-line option.
@@ -750,35 +757,14 @@ function filterDefaultReviewFiles(files, skillRelativePath) {
 }
 
 /**
- * Resolve relative JS/TS import targets to concrete repository files.
- * 中文：把 JS/TS 相对引用解析成仓库内实际文件路径。
+ * Resolve candidate repository paths and keep only existing files.
+ * 中文：解析候选仓库路径并仅保留存在的文件，用于通用语言适配层的引用扩展。
  *
  * @param {string} repoRoot Repository root.
- * @param {string} fromFile File containing the import.
- * @param {string} specifier Import or require specifier.
+ * @param {string[]} candidates Repository-relative file candidates.
  * @returns {string[]} Existing target files.
  */
-function resolveRelativeImport(repoRoot, fromFile, specifier) {
-  if (!specifier.startsWith(".")) {
-    return [];
-  }
-
-  const fromDir = path.dirname(fromFile);
-  const base = normalizeRepoPath(path.join(fromDir, specifier));
-  const candidates = [
-    base,
-    `${base}.js`,
-    `${base}.cjs`,
-    `${base}.mjs`,
-    `${base}.ts`,
-    `${base}.tsx`,
-    `${base}.jsx`,
-    `${base}/index.js`,
-    `${base}/index.ts`,
-    `${base}/index.tsx`,
-    `${base}/index.jsx`
-  ];
-
+function resolveReferenceCandidates(repoRoot, candidates) {
   return normalizePathList(candidates).filter(candidate => {
     if (!isPathInsideRepo(repoRoot, candidate)) {
       return false;
@@ -796,10 +782,6 @@ function resolveRelativeImport(repoRoot, fromFile, specifier) {
  * @returns {string[]} Directly referenced files.
  */
 function extractDirectReferenceFiles(repoRoot, filePath) {
-  if (!/\.[cm]?[jt]sx?$/i.test(filePath)) {
-    return [];
-  }
-
   const absolutePath = path.resolve(repoRoot, filePath);
   if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
     return [];
@@ -807,18 +789,9 @@ function extractDirectReferenceFiles(repoRoot, filePath) {
 
   const content = fs.readFileSync(absolutePath, "utf8");
   const references = [];
-  const patterns = [
-    /\brequire\(\s*["']([^"']+)["']\s*\)/g,
-    /\bimport\s+(?:[^"']+?\s+from\s+)?["']([^"']+)["']/g,
-    /\bexport\s+[^"']*?\s+from\s+["']([^"']+)["']/g
-  ];
-
-  for (const pattern of patterns) {
-    let match = pattern.exec(content);
-    while (match) {
-      references.push(...resolveRelativeImport(repoRoot, filePath, match[1]));
-      match = pattern.exec(content);
-    }
+  const plans = collectRelativeReferencePlans(filePath, content);
+  for (const plan of plans) {
+    references.push(...resolveReferenceCandidates(repoRoot, plan.candidates));
   }
 
   return normalizePathList(references);
@@ -1752,6 +1725,23 @@ ${buildTestBrief(testCmd, testResult, parsedTestSummary, staticSkippedTestsCount
 }
 
 /**
+ * Decide whether a path likely belongs to a test file across common languages.
+ * 中文：判断路径是否像测试文件（跨语言），用于识别跳过测试信号时降噪。
+ *
+ * @param {string} filePath Repository-relative path.
+ * @returns {boolean} True when path looks like a test file.
+ */
+function isLikelyTestFilePath(filePath) {
+  const normalized = normalizeRepoPath(filePath);
+  return /(^|\/)(test|tests|__tests__)\//i.test(normalized)
+    || /\.test\.[cm]?jsx?$/i.test(normalized)
+    || /\.spec\.[cm]?jsx?$/i.test(normalized)
+    || /(^|\/)test_.*\.py$/i.test(normalized)
+    || /_test\.(py|go|rb|php|java|kt|scala)$/i.test(normalized)
+    || /Test\.java$/i.test(normalized);
+}
+
+/**
  * Detect review signals that may deserve closer attention.
  * 中文：从结构化 diff 和测试摘要中提取疑似风险信号，但不判断风险等级。
  * The LLM reviewer must use these as evidence pointers only; final severity,
@@ -1777,7 +1767,7 @@ function detectReviewSignals(diffText, ignoredPaths, parsedTestSummary) {
   };
 
   for (const record of records) {
-    const isTestFile = /(^|\/)(test|tests|__tests__)\//i.test(record.filePath) || /\.test\.[cm]?jsx?$/i.test(record.filePath) || /\.spec\.[cm]?jsx?$/i.test(record.filePath);
+    const isTestFile = isLikelyTestFilePath(record.filePath);
     const isSourceFile = !isTestFile;
 
     if (record.kind !== "added") {
@@ -1815,7 +1805,7 @@ function detectReviewSignals(diffText, ignoredPaths, parsedTestSummary) {
       });
     }
 
-    if (isTestFile && /test\.skip|describe\.skip|it\.skip/.test(record.content)) {
+    if (isTestFile && isSkippedTestMarker(record.content)) {
       addSignal({
         type: "skipped_test_signal",
         dedupeKey: `skipped_critical_test:${record.filePath}:${record.lineNumber}`,
@@ -1827,7 +1817,7 @@ function detectReviewSignals(diffText, ignoredPaths, parsedTestSummary) {
   }
 
   for (const record of records) {
-    const isTestFile = /(^|\/)(test|tests|__tests__)\//i.test(record.filePath) || /\.test\.[cm]?jsx?$/i.test(record.filePath) || /\.spec\.[cm]?jsx?$/i.test(record.filePath);
+    const isTestFile = isLikelyTestFilePath(record.filePath);
     const isSourceFile = !isTestFile;
 
     if (record.kind !== "deleted") {
@@ -1901,7 +1891,7 @@ function detectCurrentFileSignals(repoRoot, reviewFiles, ignoredPaths = new Set(
       continue;
     }
 
-    const isTestFile = /(^|\/)(test|tests|__tests__)\//i.test(filePath) || /\.test\.[cm]?jsx?$/i.test(filePath) || /\.spec\.[cm]?jsx?$/i.test(filePath);
+    const isTestFile = isLikelyTestFilePath(filePath);
     const isSourceFile = !isTestFile;
     const lines = fs.readFileSync(absolutePath, "utf8").split(/\r?\n/);
 
@@ -1938,7 +1928,7 @@ function detectCurrentFileSignals(repoRoot, reviewFiles, ignoredPaths = new Set(
         });
       }
 
-      if (/test\.skip|describe\.skip|it\.skip/.test(line)) {
+      if (isTestFile && isSkippedTestMarker(line)) {
         addSignal({
           type: "current_skipped_test_signal",
           dedupeKey: `current_skipped_test:${filePath}:${lineNumber}`,
@@ -2062,41 +2052,43 @@ function buildSensitiveLiteralFindings(diffText, ignoredPaths = new Set()) {
 }
 
 /**
- * Check whether a path is a JavaScript file that `node --check` can parse.
- * 中文：判断文件是否适合用 `node --check` 做 JavaScript 语法检查。
- * This intentionally excludes TypeScript and JSX because plain Node syntax
- * checking would produce false failures without a project-specific compiler.
- *
- * @param {string} filePath Repository-relative path.
- * @returns {boolean} True for `.js`, `.cjs`, or `.mjs` files.
- */
-function isJavaScriptFile(filePath) {
-  return [".js", ".cjs", ".mjs"].includes(path.extname(filePath).toLowerCase());
-}
-
-/**
- * Run syntax checks for changed JavaScript files.
- * 中文：对变更的 JavaScript 文件运行语法检查，提供语法类结论证据。
- * These results provide explicit evidence before the final report claims a
- * syntax error, parser failure, or application-startup risk.
+ * Run syntax checks for changed files using language adapters.
+ * 中文：使用语言适配层对变更文件执行语法检查（仅采集证据，不修改任何源码数据）。
+ * Adapters can provide per-language non-mutating check commands, while files
+ * without an adapter are explicitly marked as skipped.
  *
  * @param {string} repoRoot Repository root where commands should run.
  * @param {{status:string, filePath:string}[]} changes Reviewable file changes.
  * @returns {string} Markdown command blocks for syntax checks.
  */
 function buildSyntaxCheck(repoRoot, changes) {
-  const jsFiles = changes
-    .map(change => change.filePath)
-    .filter((filePath, index) => filePath && !changes[index].status.startsWith("D") && isJavaScriptFile(filePath));
+  const results = [];
+  const skipped = [];
 
-  if (jsFiles.length === 0) {
-    return "No changed JavaScript files to syntax-check.";
+  for (const change of changes) {
+    if (!change || !change.filePath || change.status.startsWith("D")) {
+      continue;
+    }
+
+    const plan = buildSyntaxCheckPlan(change.filePath);
+    if (!plan) {
+      skipped.push(change.filePath);
+      continue;
+    }
+
+    const result = run(plan.command, plan.args, repoRoot);
+    results.push(commandBlock(plan.display, result));
   }
 
-  return jsFiles.map(filePath => {
-    const result = run("node", ["--check", filePath], repoRoot);
-    return commandBlock(`node --check ${filePath}`, result);
-  }).join("\n\n");
+  if (results.length === 0) {
+    return "No changed files matched an available non-mutating syntax checker.";
+  }
+
+  if (skipped.length > 0) {
+    results.push(`Skipped syntax check (no adapter): ${skipped.join(", ")}`);
+  }
+
+  return results.join("\n\n");
 }
 
 /**
@@ -2126,10 +2118,7 @@ function looksTextLike(filePath) {
  * @returns {boolean} True when code/config signal scanning is useful.
  */
 function shouldScanFileForSignals(filePath) {
-  const signalExtensions = new Set([
-    ".cjs", ".env", ".js", ".json", ".jsx", ".mjs", ".ts", ".tsx", ".yaml", ".yml"
-  ]);
-  return signalExtensions.has(path.extname(filePath).toLowerCase());
+  return shouldScanSignals(filePath);
 }
 
 /**
@@ -2244,7 +2233,7 @@ function parseTestSummary(testResult) {
     return null;
   }
 
-  return parseNodeTestSummary(`${testResult.stdout}\n${testResult.stderr}`);
+  return parseAdapterTestSummary(`${testResult.stdout}\n${testResult.stderr}`);
 }
 
 /**
