@@ -26,8 +26,7 @@ review demonstrations only.
 ## Suggested Review Commands
 
 ```bash
-node scripts/collect-review-context.js --repo . --no-tests --brief-only
-node scripts/collect-review-context.js --repo . --path examples/python-order-service
-node scripts/collect-review-context.js --repo . --path examples/go-checkout-service
+node .skills/codeflow-guard/scripts/collect-review-context.js --repo . --no-tests --brief-only
+node .skills/codeflow-guard/scripts/collect-review-context.js --repo . --path examples/python-order-service
+node .skills/codeflow-guard/scripts/collect-review-context.js --repo . --path examples/go-checkout-service
 ```
-

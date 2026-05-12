@@ -122,8 +122,13 @@ function parseArgs(argv) {
  * @returns {void}
  */
 function printHelp() {
+  const relativeScriptPath = normalizeRepoPath(path.relative(process.cwd(), __filename));
+  const displayScriptPath = relativeScriptPath && !relativeScriptPath.startsWith("../")
+    ? relativeScriptPath
+    : __filename;
+
   process.stdout.write(`Usage:
-  node scripts/collect-review-context.js [options]
+  node ${displayScriptPath} [options]
 
 Options:
   --repo <path>             Repository or subdirectory to inspect. Defaults to cwd.
@@ -470,7 +475,7 @@ function buildReviewFilesSection(command, result, reviewFiles, scopePaths = []) 
     ? `Scope mode: specified paths plus direct relative references (${scopePaths.join(", ")})`
     : "Scope mode: all repository files";
   const lines = reviewFiles.length > 0
-    ? reviewFiles.map(file => `${file.status || "R"}\t${file.filePath}${file.source ? `\t${file.source}` : ""}`)
+    ? reviewFiles.map(file => `${file.status || "REVIEW"}\t${file.filePath}${file.source ? `\t${file.source}` : ""}`)
     : ["(no files)"];
 
   return commandBlock(command, {
@@ -634,7 +639,7 @@ function parsePathLines(output) {
  */
 function buildReviewFileRecords(filePaths, source) {
   return filePaths.map(filePath => ({
-    status: "R",
+    status: "REVIEW",
     filePath,
     source
   }));
@@ -1593,7 +1598,7 @@ function buildReviewFilesBrief(reviewFiles, maxFiles = 120) {
 
   const lines = reviewFiles
     .slice(0, maxFiles)
-    .map((file, index) => `${index + 1}. ${file.status || "R"} ${file.filePath}`);
+    .map((file, index) => `${index + 1}. ${file.status || "REVIEW"} ${file.filePath}`);
   const omitted = reviewFiles.length - lines.length;
   if (omitted > 0) {
     lines.push(`... 还有 ${omitted} 个文件未在简报展开；最终报告前必须读取 Review Files 全量清单。`);

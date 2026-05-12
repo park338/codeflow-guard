@@ -11,14 +11,15 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
 ## 审查流程
 
 1. 优先运行上下文采集脚本：
-   `node scripts/collect-review-context.js`
+   `node <skill-root>/scripts/collect-review-context.js --repo .`
 2. 如果用户提供测试命令，传入脚本：
-   `node scripts/collect-review-context.js --test-cmd "<test command>"`
-3. 如果 Skill 安装在子目录但要审查业务仓库，使用 `--repo "<业务仓库路径>"`；未指定路径时脚本审查目标仓库全部可审查文件，并自动排除 Skill 自身目录。
-4. 如果用户指定审查范围，使用可重复的 `--path "<文件或目录>"`；脚本只审查指定范围，并自动纳入直接相对引用文件。
-5. 如果脚本不可用，再手动运行 `git status --short --branch`、`git diff --stat`、`git diff --name-status`、`git diff --check`、`git diff` 和相关测试命令。
-6. 读取 `references/risk-rubric.md` 判断风险等级。
-7. 读取 `references/output-template.md` 生成最终报告。
+   `node <skill-root>/scripts/collect-review-context.js --repo . --test-cmd "<test command>"`
+3. `<skill-root>` 是当前 `SKILL.md` 所在目录；在本仓库测试时是 `.skills/codeflow-guard`，安装到业务仓库时通常是 `.codebuddy/skills/codeflow-guard`。
+4. 如果 Skill 安装在子目录但要审查业务仓库，使用 `--repo "<业务仓库路径>"`；未指定路径时脚本审查目标仓库全部可审查文件，并自动排除 Skill 自身目录。
+5. 如果用户指定审查范围，使用可重复的 `--path "<文件或目录>"`；脚本只审查指定范围，并自动纳入直接相对引用文件。
+6. 如果脚本不可用，再手动运行 `git status --short --branch`、`git diff --stat`、`git diff --name-status`、`git diff --check`、`git diff` 和相关测试命令。
+7. 读取 `references/risk-rubric.md` 判断风险等级。
+8. 读取 `references/output-template.md` 生成最终报告。
 
 ## 风险等级
 
