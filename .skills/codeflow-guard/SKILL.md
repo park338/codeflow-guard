@@ -32,6 +32,7 @@ allowed-tools: Read, Grep, Bash(git:*), Bash(node:*), Bash(npm:*), Bash(pnpm:*),
 
 - 使用中文输出。
 - 先把脚本输出中的 `Review Brief` 和 `Review Files` 当作审查任务单：待判断文件必须逐个进入“变更摘要”，疑似风险信号必须逐个核验。
+- 脚本输出的事实数据是权威来源，包括待判断文件数、Git diff 变更文件数、Diff 状态、测试执行状态、测试执行结果、静态扫描发现跳过测试总数和行号证据；最终报告若与脚本事实冲突，必须先重新核查并以脚本数据为准。
 - 目录名不能作为跳过理由；`examples/`、`samples/`、`demo/`、`test/` 等路径只要在待判断文件中，就按实际变更审查。
 - 严格使用 `references/output-template.md` 的分节顺序，不要省略任何必填章节。
 - 脚本只负责收集证据和疑似风险信号；最终风险等级、风险计数和合并建议必须由 LLM 根据 `references/risk-rubric.md` 与上下文判断。
