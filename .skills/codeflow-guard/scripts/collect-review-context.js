@@ -1262,15 +1262,16 @@ function buildReportContract(testCmd) {
 3. 最终 P0/P1/P2/P3、风险计数和合并建议由你根据证据与 risk-rubric.md 判断。
 
 硬约束：
-- 结论区一项一行，包含合并建议、总体风险、摘要、风险计数、测试执行状态、测试执行结果和静态发现跳过测试。
+- 结论区一项一行，包含合并建议、总体风险、摘要、风险计数、测试执行状态、测试执行结果、静态扫描发现跳过测试总数和本次需处理的跳过测试。
 - 测试未运行时，“测试执行结果”必须写“无执行结果”，不要写“通过=0，失败=0，跳过=0”。
+- “静态扫描发现跳过测试总数”必须取 Review Brief 的同名字段；“本次需处理的跳过测试”由你结合当前审查目标、风险路径和变更相关性判断。两者不一致时必须说明筛选依据。
 - 审查上下文必须包含待判断文件数、审查类型、审查模式、Git diff 变更文件数、Diff 状态、测试命令（${testCmd || "(not provided)"}）和 Diff Check 结果。
 - Git diff 变更文件数为 0 只代表当前无 diff 改动，不代表没有待判断文件；若审查类型是静态审查或静态巡检，不要写成本次 diff 引入风险。
 - Top 3 和关键风险标题使用 path:line；优先取 Changed Line Anchors，再取 Current File Snapshots。
 - Sensitive Literal Findings 是证据来源；是否进入关键风险及风险等级由你结合上下文判断，敏感值只引用脱敏证据。
 - 风险计数按“关键风险”条目数量统计；同一根因可以合并为一个条目，但计数必须与条目总数一致。
 - 没有 coverage 工具输出时，不要把通过/跳过比例写成覆盖率。
-- skipped 测试必须作为测试风险。`;
+- 与本次审查目标或 P0/P1 风险路径相关的 skipped 测试必须作为测试风险。`;
 }
 
 /**
@@ -1657,7 +1658,7 @@ function countStaticSkippedTestSignals(reviewSignals) {
  * @param {string|null} testCmd Test command.
  * @param {{status:number}|null} testResult Test command result.
  * @param {object|null} parsedTestSummary Parsed test summary.
- * @param {number} staticSkippedTestsCount Static skipped-test signal count.
+ * @param {number} staticSkippedTestsCount Static skipped-test signal total.
  * @returns {string} Compact test summary.
  */
 function buildTestBrief(testCmd, testResult, parsedTestSummary, staticSkippedTestsCount) {
@@ -1665,7 +1666,7 @@ function buildTestBrief(testCmd, testResult, parsedTestSummary, staticSkippedTes
     return `- 测试命令：(未提供)
 - 测试执行状态：未运行
 - 测试执行结果：无执行结果
-- 静态发现跳过测试：${staticSkippedTestsCount}`;
+- 静态扫描发现跳过测试总数：${staticSkippedTestsCount}`;
   }
 
   const executionStatus = testResult.status === 0 ? "已运行" : "运行失败";
@@ -1676,7 +1677,7 @@ function buildTestBrief(testCmd, testResult, parsedTestSummary, staticSkippedTes
   return `- 测试命令：${testCmd}
 - 测试执行状态：${executionStatus}
 - 测试执行结果：${executionResult}
-- 静态发现跳过测试：${staticSkippedTestsCount}
+- 静态扫描发现跳过测试总数：${staticSkippedTestsCount}
 - 退出码：${testResult.status}`;
 }
 
