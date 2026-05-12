@@ -1264,8 +1264,8 @@ function buildReportContract(testCmd) {
 硬约束：
 - 结论区一项一行，包含合并建议、总体风险、摘要、风险计数、测试执行状态、测试执行结果和静态发现跳过测试。
 - 测试未运行时，“测试执行结果”必须写“无执行结果”，不要写“通过=0，失败=0，跳过=0”。
-- 审查上下文必须包含待判断文件数、审查模式、Git diff 变更文件数、测试命令（${testCmd || "(not provided)"}）和 Diff Check 结果。
-- Git diff 变更文件数为 0 只代表当前无 diff 改动，不代表本次无审查内容。
+- 审查上下文必须包含待判断文件数、审查类型、审查模式、Git diff 变更文件数、Diff 状态、测试命令（${testCmd || "(not provided)"}）和 Diff Check 结果。
+- Git diff 变更文件数为 0 只代表当前无 diff 改动，不代表没有待判断文件；若审查类型是静态审查或静态巡检，不要写成本次 diff 引入风险。
 - Top 3 和关键风险标题使用 path:line；优先取 Changed Line Anchors，再取 Current File Snapshots。
 - Sensitive Literal Findings 是证据来源；是否进入关键风险及风险等级由你结合上下文判断，敏感值只引用脱敏证据。
 - 风险计数按“关键风险”条目数量统计；同一根因可以合并为一个条目，但计数必须与条目总数一致。
@@ -1681,6 +1681,48 @@ function buildTestBrief(testCmd, testResult, parsedTestSummary, staticSkippedTes
 }
 
 /**
+ * Describe whether the review is diff-driven or static-scope-driven.
+ * 中文：描述本次审查是当前 diff 审查，还是指定范围/全仓静态审查。
+ * This is factual context only; it does not change risk severity or merge advice.
+ *
+ * @param {number} changedFileCount Count of reviewable git diff files.
+ * @param {number} reviewFileCount Count of files in the review scope.
+ * @param {string[]} scopePaths User-provided scope paths.
+ * @returns {string} Human-readable review type.
+ */
+function describeReviewType(changedFileCount, reviewFileCount, scopePaths = []) {
+  if (changedFileCount > 0) {
+    return scopePaths.length > 0 ? "指定路径当前变更审查" : "当前变更审查";
+  }
+
+  if (reviewFileCount > 0) {
+    return scopePaths.length > 0 ? "指定路径静态审查" : "全仓静态巡检";
+  }
+
+  return "无可审查内容";
+}
+
+/**
+ * Explain what `git diff` evidence means for the current review.
+ * 中文：解释 Git diff 数量的真实含义，避免 diff=0 被误解为没有审查内容。
+ *
+ * @param {number} changedFileCount Count of reviewable git diff files.
+ * @param {number} reviewFileCount Count of files in the review scope.
+ * @returns {string} Diff status text for the report brief.
+ */
+function describeDiffStatus(changedFileCount, reviewFileCount) {
+  if (changedFileCount > 0) {
+    return "检测到当前 diff 改动，风险可结合变更内容判断";
+  }
+
+  if (reviewFileCount > 0) {
+    return "当前 diff 改动为 0；风险来自待判断文件的当前内容或指定范围静态验收，不应写作本次 diff 引入";
+  }
+
+  return "当前 diff 改动为 0，且未发现待判断文件";
+}
+
+/**
  * Build the first, compact section the LLM should use before detailed evidence.
  * 中文：生成首屏简版审查摘要，让模型先抓住完整变更范围和疑似信号。
  * Directory names are not treated as skip signals; every listed changed file is
@@ -1700,8 +1742,10 @@ function buildReviewBrief({ reviewFiles, changedFiles, reviewSignals, testCmd, t
   const reviewMode = scopePaths.length > 0
     ? `指定路径 + 直接引用扩展（${scopePaths.join(", ")}）`
     : "未指定路径，扫描仓库全部可审查文件";
+  const reviewType = describeReviewType(changedFiles.length, reviewFiles.length, scopePaths);
+  const diffStatus = describeDiffStatus(changedFiles.length, reviewFiles.length);
   const noDiffButHasReviewFilesNote = changedFiles.length === 0 && reviewFiles.length > 0
-    ? "\n- 说明：Git diff 变更文件数为 0 仅表示当前无 diff 改动，不代表本次无审查内容。"
+    ? "\n- 说明：Git diff 变更文件数为 0 仅表示当前无 diff 改动，不代表没有待判断文件或没有静态风险。"
     : "";
   const staticSkippedTestsCount = countStaticSkippedTestSignals(reviewSignals);
 
@@ -1713,8 +1757,10 @@ function buildReviewBrief({ reviewFiles, changedFiles, reviewSignals, testCmd, t
 
 审查覆盖：
 - 待判断文件数：${reviewFiles.length}
+- 审查类型：${reviewType}
 - 审查模式：${reviewMode}
 - Git diff 变更文件数：${changedFiles.length}${noDiffButHasReviewFilesNote}
+- Diff 状态：${diffStatus}
 - 下面每个文件都必须进入“变更摘要”，并给出一句文件级判断。
 - 目录名不能作为跳过理由；只要在待判断文件中，就按实际变更审查。
 
